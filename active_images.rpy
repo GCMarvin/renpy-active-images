@@ -12,15 +12,15 @@
 ## SPDX-License-Identifier: MIT
 
 python early in active_images:
-    from renpy.ast import Say
-    from renpy.display.behavior import Button
+    from renpy.ast import Say, Show
+    from renpy.display.behavior import Button, render_focus_mask
     from renpy.display.core import Displayable, IgnoreEvent
     from renpy.display.focus import Focus
     from renpy.display.image import ImageReference
     from renpy.display.layout import Null
     from renpy.display.render import Render
     from renpy.display.scenelists import SceneListEntry, SceneLists
-    from renpy.display.transform import Transform
+    from renpy.display.transform import ATLTransform, Transform
     from renpy.game import CallException, JumpException
     from renpy.lexer import Lexer
     from renpy.python import NoRollback
@@ -149,31 +149,20 @@ python early in active_images:
             self.window_size = (sw, sh)
 
             if not self.locked and self.clicked is not None:
-                mask = self.style.focus_mask
-                fmx = fmy = 0
-
-                if mask is True:
-                    mask = rv
-                elif mask is not None and not callable(mask):
-                    try:
-                        mask = renpy.easy.displayable(mask)
-                    except Exception:
-                        raise Exception(
-                            "Focus_mask must be None, True, a displayable, or a callable."
-                        )
-
-                if self.style.focus_rect is not None:
-                    fx, fy, fw, fh = self.style.focus_rect
-                    if isinstance(mask, Displayable):
-                        fmx, fmy = fx, fy
-                        mask = renpy.display.render.render(mask, fw, fh, st, at)
+                fx, fy, fw, fh = (
+                    self.style.focus_rect
+                    if self.style.focus_rect is not None
+                    else compute_active_focus_rect(surf, sw, sh)
+                )
+                mask = render_focus_mask(self.style.focus_mask, sw, sh, st, at, rv)
+                if mask is not None:
+                    fmx = 0
+                    fmy = 0
+                    if mask is not False:
+                        mask = make_occluded_focus_mask(rv, mask, fmx, fmy)
                 else:
-                    if isinstance(mask, Displayable):
-                        mask = renpy.display.render.render(mask, sw, sh, st, at)
-                    fx, fy, fw, fh = compute_active_focus_rect(surf, sw, sh)
-
-                if mask is not None and mask is not False:
-                    mask = make_occluded_focus_mask(rv, mask, fmx, fmy)
+                    fmx = None
+                    fmy = None
 
                 rv.add_focus(self, None, fx, fy, fw, fh, fmx, fmy, mask)
 
@@ -205,12 +194,14 @@ python early in active_images:
                 self.clicked, self.alternate = orig_clicked, orig_alternate
 
         def set_transform_event(self, event: str) -> None:
-            """Forward button state transform events upward to enclosing
-            scene-list ``Transform``s.
+            """Forward button state transform events to ``self.child``
+            and upward to enclosing scene-list ``Transform``s.
 
             Args:
                 event (str): The transform event name.
             """
+            if self.child is not None:
+                self.child.set_transform_event(event)
             super().set_transform_event(event)
             if self.locked or event not in renpy.config.containers_pass_transform_events:
                 return
@@ -218,7 +209,7 @@ python early in active_images:
             changed = event != self.last_button_event
             self.last_button_event = event
 
-            for t in iter_enclosing_transforms(self):
+            for t in reversed(iter_enclosing_transforms(self)):
                 block = (t.get_block() or t.compile()) if hasattr(t, "get_block") else None
                 has_pending_scene_event = (
                     t.transform_event is not None
@@ -232,6 +223,8 @@ python early in active_images:
                         t.last_transform_event = event
                     else:
                         renpy.display.render.redraw(t, 0)
+                if isinstance(t.child, Transform):
+                    t.last_child_transform_event = t.child.transform_event
 
         def set_style_prefix(self, prefix: str, root: bool) -> None:
             """Propagate the button's style prefix (``idle_``,
@@ -424,6 +417,8 @@ python early in active_images:
             renpy.exports.with_statement(None)
 
         sle = get_sle(resolved_layer, key)
+        if sle is not None:
+            init_transform_chain(sle.displayable)
         existing_active = find_active_image(sle.displayable) if sle is not None else None
         new_name, leaf_img = resolve_target_image(name, expression, what, key, resolved_layer, sle)
 
@@ -457,24 +452,6 @@ python early in active_images:
             atl=atl,
         )
 
-        if (
-            isinstance(default_transform := renpy.config.default_transform, Transform)
-            and (new_sle := get_sle(resolved_layer, key)) is not None
-            and isinstance(new_sle.displayable, Transform)
-        ):
-            state = new_sle.displayable.state
-            for pos_attr, inh_attr, val in zip(
-                ("xpos", "ypos", "xanchor", "yanchor"),
-                ("inherited_xpos", "inherited_ypos", "inherited_xanchor", "inherited_yanchor"),
-                default_transform.get_placement()[:4],
-            ):
-                if (
-                    getattr(state, pos_attr, None) is None
-                    and getattr(state, inh_attr, None) is None
-                    and val is not None
-                ):
-                    setattr(state, inh_attr, val)
-
         if with_expr is not None:
             renpy.exports.with_statement(renpy.python.py_eval(with_expr))
 
@@ -506,6 +483,8 @@ python early in active_images:
             renpy.exports.with_statement(None)
 
         sle = get_sle(resolved_layer, key)
+        if sle is not None:
+            init_transform_chain(sle.displayable)
         existing_active = find_active_image(sle.displayable) if sle is not None else None
         new_name, leaf_img = resolve_target_image(name, expression, what, key, resolved_layer, sle)
 
@@ -557,44 +536,30 @@ python early in active_images:
 
     def lint_activate_or_deactivate(p: dict[str, Any], is_deactivate: bool = False) -> None:
         """Validate layers, images, transforms, and button expressions
-        during lint.
+        during lint by delegating ``imspec`` checks to ``renpy.lint``.
 
         Args:
             p (dict[str, Any]): Parsed statement dictionary.
             is_deactivate (bool, default=False): ``True`` when linting
                 ``deactivate``, ``False`` when linting ``activate``.
         """
-        name, expression, tag, at_list, layer, zorder, behind = p["imspec"]
+        imspec = p["imspec"]
+        name, expression, tag, at_list, layer, zorder, behind = imspec
         stmt = "deactivate" if is_deactivate else "activate"
-        key = tag or (name[0] if name else None)
+        node = Show((None, 0), imspec)
 
-        resolved_layer = renpy.exports.default_layer(layer, key, expression is not None)
-        if resolved_layer not in renpy.display.scenelists.layers:
-            renpy.lint.report("Uses layer '%s', which is not defined.", resolved_layer)
-
-        if expression is not None:
-            if key is not None:
-                renpy.lint.image_prefixes[key] = True
-            renpy.lint.try_eval(f"the expression of a {stmt} statement", expression)
-        elif is_deactivate:
-            if key not in renpy.lint.image_prefixes:
-                renpy.lint.report(
-                    "The image tag '%s' is not the prefix of a declared image, nor was it used in"
-                    " a show statement before this deactivate statement.",
-                    key,
+        if is_deactivate and expression is None:
+            renpy.lint.check_hide(node)
+            if zorder is not None:
+                renpy.lint.try_eval(f"the zorder of a {stmt} statement", zorder)
+            for expr in at_list:
+                renpy.lint.try_eval(
+                    f"the at list of a {stmt} statement",
+                    expr,
+                    "Perhaps you forgot to define or misspelled a transform.",
                 )
         else:
-            renpy.lint.image_exists(name, expression, tag, precise=False)
-
-        if zorder is not None:
-            renpy.lint.try_eval(f"the zorder of a {stmt} statement", zorder)
-
-        for expr in at_list:
-            renpy.lint.try_eval(
-                f"the at list of a {stmt} statement",
-                expr,
-                "Perhaps you forgot to define or misspelled a transform.",
-            )
+            renpy.lint.check_show(node, False)
 
         for kw, expr in p.get("button_clauses", {}).items():
             renpy.lint.try_eval(f"the {kw} clause of a {stmt} statement", expr)
@@ -1029,6 +994,115 @@ python early in active_images:
         return (key,) + new_name[1:], ImageReference(full_name, style="image_placement")
 
 
+    def init_transform_chain(d: Displayable | None) -> None:
+        """Initialize any unstarted ``Transform``s in ``d`` from
+        innermost to outermost.
+
+        Ensures newly created transforms (such as parameterized ATL
+        transforms shown earlier in the same interaction) compile their
+        ATL block and initialize ``atl_state`` at ``st=0`` before
+        ``SceneLists.hide_or_replace`` or ``transform_state`` inspects
+        them.
+
+        Args:
+            d (Displayable | None): Root displayable to initialize.
+        """
+        if d is None:
+            return
+        chain: list[Transform] = []
+        curr: Displayable | None = d
+        while isinstance(curr, Transform):
+            chain.append(curr)
+            curr = curr.child
+        for t in reversed(chain):
+            if not t.active:
+                t.update_state()
+        d.get_placement()
+
+
+    def is_button_transform(t: Transform) -> bool:
+        """Return whether ``t`` handles button transform events
+        (``hover``, ``idle``, etc.) or style-prefixed transform
+        arguments (``hover_zoom``, ``idle_alpha``, etc.).
+
+        Args:
+            t (Transform): The ``Transform`` or ``ATLTransform`` to
+                inspect.
+
+        Returns:
+            bool: ``True`` if ``t`` is a button state transform.
+        """
+        if t.arguments and any(k for k in t.arguments if k != ""):
+            return True
+        if isinstance(t, ATLTransform):
+            block = t.get_block() or t.compile()
+            if block is not None:
+                return any(
+                    block._handles_event(ev)
+                    for ev in renpy.config.containers_pass_transform_events
+                )
+        return False
+
+
+    def split_transform_chain(
+        d: Displayable,
+    ) -> tuple[list[Transform], list[Transform], Displayable]:
+        """Partition a displayable's ``Transform`` chain into outer
+        scene transforms, inner button transforms, and the leaf
+        displayable.
+
+        Args:
+            d (Displayable): Root displayable to split.
+
+        Returns:
+            tuple[list[Transform], list[Transform], Displayable]:
+                ``(scene_chain, button_chain, leaf)``, where each list
+                is ordered from innermost to outermost.
+        """
+        scene_chain: list[Transform] = []
+        button_chain: list[Transform] = []
+        curr: Displayable = d
+        while isinstance(curr, Transform) and curr.child is not None:
+            if is_button_transform(curr):
+                button_chain.append(curr)
+            else:
+                scene_chain.append(curr)
+            curr = curr.child
+        scene_chain.reverse()
+        button_chain.reverse()
+        return scene_chain, button_chain, curr
+
+
+    def chain_transforms(
+        transforms: list[Transform], leaf: Displayable, copy: bool = False
+    ) -> Displayable:
+        """Wrap ``leaf`` in ``transforms`` from innermost to outermost.
+
+        Args:
+            transforms (list[Transform]): ``Transform`` instances ordered
+                from innermost to outermost.
+            leaf (Displayable): Innermost child displayable.
+            copy (bool, default=False): Whether to copy each
+                ``Transform`` before linking.
+
+        Returns:
+            Displayable: The wrapped displayable chain.
+        """
+        curr: Displayable = leaf
+        for t in transforms:
+            if copy:
+                t.get_placement()
+                node = t.copy()
+                node.st_offset = 0
+                node.at_offset = 0
+            else:
+                node = t
+            node.set_child(curr, duplicate=False)
+            node._unique()
+            curr = node
+        return curr
+
+
     orig_transform_state = getattr(
         SceneLists.transform_state, "orig_transform_state", SceneLists.transform_state
     )
@@ -1040,13 +1114,16 @@ python early in active_images:
         new_thing: Displayable,
         execution: bool = False,
     ) -> Displayable:
-        """Wrap ``SceneLists.transform_state`` so normal ``show``
-        statements preserve ``ActiveImage``.
+        """Wrap ``SceneLists.transform_state`` so ``show``,
+        ``activate``, and ``deactivate`` preserve ``ActiveImage`` and
+        maintain separate scene and button ``TransformState`` layers.
 
-        When an active sprite is updated by a normal ``show`` statement
-        with ``at`` transforms or an ATL block (``execution=False``),
-        injects a copy of the existing ``ActiveImage`` around the new
-        leaf displayable before transferring outer transform state.
+        Keeping scene transforms on the outside and button state
+        transforms (``on hover:`` / ``on idle:``) on the inside prevents
+        button state handlers from clobbering inherited scene properties
+        (such as ``flip``'s ``matrixtransform``) and allows ongoing
+        scene animations (such as ``slot(2)``) to continue running when
+        a button transform is attached.
 
         Args:
             self (SceneLists): The active ``SceneLists`` instance.
@@ -1058,18 +1135,55 @@ python early in active_images:
                 is also being transferred.
 
         Returns:
-            Displayable: ``new_thing`` with transform state (and
-                ``ActiveImage`` wrapper, if active) preserved.
+            Displayable: ``new_thing`` with scene and button transform
+                chains and ``ActiveImage`` wrapper preserved.
         """
         if old_thing is not None:
-            old_thing.get_placement()
+            init_transform_chain(old_thing)
         if not execution and (old_active := find_active_image(old_thing)) is not None:
             new_active = find_active_image(new_thing)
             if new_active is None:
                 new_thing = inject_active_child(new_thing, old_active)
             elif new_active is not old_active:
                 transfer_active_state(old_active, new_active)
-        return orig_transform_state(self, old_thing, new_thing, execution=execution)
+
+        if execution or old_thing is None or not isinstance(old_thing, Transform):
+            return orig_transform_state(self, old_thing, new_thing, execution=execution)
+
+        old_scene, old_btn, _ = split_transform_chain(old_thing)
+        new_scene, new_btn, new_leaf = split_transform_chain(new_thing)
+
+        if not old_btn and not new_btn:
+            return orig_transform_state(self, old_thing, new_thing, execution=execution)
+
+        if new_btn:
+            btn_chain = new_btn
+            if old_btn:
+                old_btn_root = chain_transforms(old_btn, Null(), copy=True)
+                new_btn_root = chain_transforms(btn_chain, new_leaf)
+                orig_transform_state(self, old_btn_root, new_btn_root, execution=True)
+                for n, o in zip(btn_chain, old_btn):
+                    if n.atl_state is not None:
+                        n.st = o.st
+                        n.at = o.at
+                        n.st_offset = 0
+                        n.at_offset = 0
+            inner_d = chain_transforms(btn_chain, new_leaf)
+        elif old_btn:
+            # Keep a copy of existing button transforms when remaining active without a new
+            # button transform, or when deactivating so hover properties smoothly transition
+            # back to `"idle"` during `execute_deactivate`.
+            inner_d = chain_transforms(old_btn, new_leaf, copy=True)
+        else:
+            inner_d = new_leaf
+
+        old_scene_root = chain_transforms(old_scene, new_leaf, copy=True) if old_scene else None
+        if new_scene:
+            new_scene_root = chain_transforms(new_scene, inner_d)
+            return orig_transform_state(self, old_scene_root, new_scene_root, execution=False)
+        if old_scene:
+            return chain_transforms(old_scene, inner_d, copy=True)
+        return inner_d
 
 
     preserve_active_transform_state.orig_transform_state = orig_transform_state
