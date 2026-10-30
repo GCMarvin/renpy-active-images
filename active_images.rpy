@@ -12,614 +12,896 @@
 ## SPDX-License-Identifier: MIT
 
 python early in active_images:
-    from renpy.ast import Say
-    from renpy.display.behavior import Button
+    _constant = True
+
+    import builtins
+    import itertools
+    from typing import Any, Callable, Iterable, Iterator
+
+    from renpy.ast import Say, Show
+    from renpy.display.behavior import Button, render_focus_mask
     from renpy.display.core import Displayable, IgnoreEvent
     from renpy.display.focus import Focus
     from renpy.display.image import ImageReference
     from renpy.display.layout import Null
+    from renpy.display.motion import ATLTransform, Transform
     from renpy.display.render import Render
-    from renpy.display.scenelists import SceneListEntry, SceneLists
-    from renpy.display.transform import Transform
+    from renpy.display.scenelists import SceneListEntry
     from renpy.game import CallException, JumpException
     from renpy.lexer import Lexer
-    from renpy.python import NoRollback
+    from renpy.parser import parse_image_specifier, parse_simple_expression_list
 
-    _constant = True
+    BUTTON_CLAUSES: frozenset[str] = frozenset({
+        "action",
+        "alternate",
+        "hovered",
+        "unhovered",
+        "selected",
+        "sensitive",
+        "keysym",
+        "alternate_keysym",
+        "focus_mask",
+    })
+    FOCUS_DIRECTIONS: dict[str, tuple[int, int]] = {
+        "focus_right": (0, 1),
+        "focus_left": (0, -1),
+        "focus_down": (1, 1),
+        "focus_up": (1, -1),
+    }
 
-
-    ###########################################################################
-    # `ActiveImage` displayable
-    ###########################################################################
+    # --- ActiveImage Displayable ---------------------------------------------
 
 
     class ActiveImage(Button):
-        """A ``Button`` subclass designed for interactive scene-list
-        sprites (``activate``).
+        """Interactive scene-list sprite wrapper inheriting from
+        Ren'Py's Button.
 
-        - Wraps the leaf image displayable directly inside any outer scene-list ``Transform``s,
-            delegating ``get_placement()`` to its child and rendering at the child's exact
-            surface size so ``image_placement`` / ``LayeredImage`` offsets are applied only once.
-        - Sets `_store_transform_event = False` so scene-list ``"replace"`` events do not
-            misfire ``Transform.last_child_transform_event`` on every dialogue line, while
-            explicitly forwarding button ``hover``/`idle`/`insensitive` transform events and
-            style prefixes upward to enclosing scene-list ``Transform``s.
-        - Implements `_change_transform_child()` and hooks ``SceneLists.transform_state``
-            so any normal ``show`` statement (with or without ``at``/ATL), character callback,
-            or dialogue attribute change updates the image or outer transforms while
-            keeping the sprite active.
+        Positioned in the scene-list displayable chain between outer
+        scene transforms (such as placement or flipping) and inner
+        button transforms (such as hover/idle ATL blocks or
+        style-prefixed properties). This split lets outer transforms
+        position the sprite on screen while ActiveImage intercepts
+        mouse/keyboard events and forwards hover/idle state only to the
+        inner button transforms.
         """
-
-        _store_transform_event: bool = False
-        last_button_event: str | None = None
 
         def __init__(
             self,
             child: Displayable | None = None,
-            style: str = "default",
-            focus_mask: Any = True,
-            focus_name: str | None = None,
-            **properties: Any,
+            layer_key: tuple[str, str] | None = None,
+            **btn_kwargs: Any,
         ) -> None:
-            """Initialize an ``ActiveImage`` wrapper around ``child``.
+            """Initialize the active image button wrapper.
+
+            Defaults action to NullAction() and focus_mask to True so
+            transparent sprite padding ignores pointer events, while
+            keeping action and alternate in their raw picklable form so
+            saving and rollback work cleanly.
 
             Args:
-                child (Displayable | None, default=None): The leaf
-                    displayable (typically an ``ImageReference``).
-                style (str, default="default"): Button style name.
-                    Defaults to ``"default"`` so button padding/margins
-                    do not shift sprite placement.
-                focus_mask (Any, default=True): Pixel hit-test mask
-                    (``True``, ``None``, a displayable, or a callable).
-                focus_name (str | None, default=None): Stable identifier
-                    for focus persistence across interactions.
-                **properties (Any): Additional ``Button`` keyword
-                    arguments (``action``, ``hovered``, etc.).
+                child (Displayable | None, default=None): Inner
+                    displayable chain (button transforms and leaf
+                    image).
+                layer_key (tuple[str, str] | None, default=None):
+                    Optional (layer, tag) pair identifying this
+                    scene-list entry.
+                **btn_kwargs (Any): Keyword arguments matching standard
+                    Button clauses.
             """
-            super().__init__(None, style=style, focus_mask=focus_mask, **properties)
-            if self.style is renpy.display.displayable.default_style:
-                self.style = renpy.style.Style(style)
-            self.last_button_event = None
-            if focus_name is not None:
-                self.focus_name = focus_name
-            self._duplicatable = False
-            if child is not None:
-                self.set_child(child)
-
-        def set_child(self, d: Displayable, duplicate: bool = True) -> None:
-            """Set ``self.child`` to ``d``, optionally duplicating
-            duplicatable displayables.
-
-            Args:
-                d (Displayable): The new child displayable.
-                duplicate (bool, default=True): Whether to call
-                    `_duplicate()` if ``d._duplicatable`` is ``True``.
-                    Set to ``False`` when ``d`` is an already-copied
-                    displayable.
-            """
-            child = renpy.easy.displayable(d)
-            if duplicate and child._duplicatable:
-                child = child._duplicate(None)
-            self._duplicatable = False
-            child._unique()
-            self.children = [child]
-            self.child = child
-            self.offsets = []
-            child.per_interact()
-            renpy.display.render.invalidate(self)
-
-        def get_placement(self) -> tuple:
-            """Return placement tuple from ``self.child`` so
-            ``ActiveImage`` is layout-transparent.
-
-            Returns:
-                tuple:
-                    ``(xpos, ypos, xanchor, yanchor, xoffset, yoffset, subpixel)``.
-            """
-            if self.child is not None:
-                return self.child.get_placement()
-            return super().get_placement()
-
-        def render(self, width: float, height: float, st: float, at: float) -> Render:
-            """Render ``self.child`` and register an occlusion-aware
-            focus region if active.
-
-            Args:
-                width (float): Available width.
-                height (float): Available height.
-                st (float): Shown time passed from the parent
-                    displayable.
-                at (float): Animation time passed from the parent
-                    displayable.
-
-            Returns:
-                Render: The rendered ``Render`` surface for this sprite.
-            """
-            if self.style.time_policy:
-                st, self.time_policy_data = self.style.time_policy(
-                    st, self.time_policy_data, self.style
-                )
-
-            surf = renpy.display.render.render(self.child, width, height, st, at)
-            sw, sh = surf.get_size()
-
-            rv = Render(sw, sh)
-            rv.blit(surf, (0, 0))
-            self.offsets = [(0, 0)]
-            self.window_size = (sw, sh)
-
-            if not self.locked and self.clicked is not None:
-                mask = self.style.focus_mask
-                fmx = fmy = 0
-
-                if mask is True:
-                    mask = rv
-                elif mask is not None and not callable(mask):
-                    try:
-                        mask = renpy.easy.displayable(mask)
-                    except Exception:
-                        raise Exception(
-                            "Focus_mask must be None, True, a displayable, or a callable."
-                        )
-
-                if self.style.focus_rect is not None:
-                    fx, fy, fw, fh = self.style.focus_rect
-                    if isinstance(mask, Displayable):
-                        fmx, fmy = fx, fy
-                        mask = renpy.display.render.render(mask, fw, fh, st, at)
-                else:
-                    if isinstance(mask, Displayable):
-                        mask = renpy.display.render.render(mask, sw, sh, st, at)
-                    fx, fy, fw, fh = compute_active_focus_rect(surf, sw, sh)
-
-                if mask is not None and mask is not False:
-                    mask = make_occluded_focus_mask(rv, mask, fmx, fmy)
-
-                rv.add_focus(self, None, fx, fy, fw, fh, fmx, fmy, mask)
-
-            return rv
+            self.layer_key = layer_key
+            self.btn_kwargs = {
+                "action": renpy.store.NullAction(),
+                "focus_mask": True,
+                **btn_kwargs,
+            }
+            focus = f"active_image:{layer_key[0]}:{layer_key[1]}" if layer_key else None
+            super().__init__(child, style="default", focus=focus, **self.btn_kwargs)
 
         def event(self, ev: Any, x: int, y: int, st: float) -> Any:
-            """Delegate input events to ``Button.event`` with click
-            recording wrappers applied.
+            """Delegate input events to Button.event with
+            click-recording wrappers applied.
+
+            Wrapping clicked and alternate only during super().event
+            (and restoring them before executing the action) keeps the
+            stored Action objects picklable for saving and rollback
+            while recording clicks for roll-forward replay.
 
             Args:
-                ev (Any): The pygame input event.
-                x (int): Local X coordinate.
-                y (int): Local Y coordinate.
+                ev (Any): Pygame input event.
+                x (int): Local X coordinate relative to this
+                    displayable.
+                y (int): Local Y coordinate relative to this
+                    displayable.
                 st (float): Shown time in seconds.
 
             Returns:
-                Any: The event result from ``Button.event``, or ``None``
-                    if locked/unhandled.
+                Any: Interaction result from Button.event, or None if
+                    unhandled.
             """
-            if self.locked:
-                return None
-
-            orig_clicked, orig_alternate = self.clicked, self.alternate
+            orig = (self.clicked, self.alternate)
             try:
-                self.clicked = wrap_click(orig_clicked)
-                self.alternate = wrap_click(orig_alternate)
+                self.clicked, self.alternate = wrap_click(self.clicked, self), wrap_click(
+                    self.alternate, self
+                )
                 return super().event(ev, x, y, st)
             finally:
-                self.clicked, self.alternate = orig_clicked, orig_alternate
+                self.clicked, self.alternate = orig
 
-        def set_transform_event(self, event: str) -> None:
-            """Forward button state transform events upward to enclosing
-            scene-list ``Transform``s.
+        def _change_transform_child(self, child: Displayable) -> Displayable:
+            """Clone this ActiveImage around a new leaf child during
+            SceneLists updates.
 
-            Args:
-                event (str): The transform event name.
-            """
-            super().set_transform_event(event)
-            if self.locked or event not in renpy.config.containers_pass_transform_events:
-                return
-
-            changed = event != self.last_button_event
-            self.last_button_event = event
-
-            for t in iter_enclosing_transforms(self):
-                block = (t.get_block() or t.compile()) if hasattr(t, "get_block") else None
-                has_pending_scene_event = (
-                    t.transform_event is not None
-                    and t.transform_event != getattr(t, "last_transform_event", None)
-                    and block is not None
-                    and block._handles_event(t.transform_event)
-                )
-                if not (has_pending_scene_event and event.endswith("idle")):
-                    t.transform_event = event
-                    if not changed and getattr(t, "atl_state", None) is not None:
-                        t.last_transform_event = event
-                    else:
-                        renpy.display.render.redraw(t, 0)
-
-        def set_style_prefix(self, prefix: str, root: bool) -> None:
-            """Propagate the button's style prefix (``idle_``,
-            ``hover_``, etc.) to enclosing ``Transform``s.
+            Displayable._change_transform_child normally returns child
+            directly, which would discard a Button wrapper when Ren'Py's
+            SceneLists.add updates an image without new transforms.
+            Overriding this method preserves both the ActiveImage
+            wrapper and any inner button transforms.
 
             Args:
-                prefix (str): The style prefix string.
-                root (bool): Whether ``self`` is the root of the prefix
-                    change.
-            """
-            super().set_style_prefix(prefix, root)
-            if self.locked:
-                return
-            for t in iter_enclosing_transforms(self):
-                if getattr(t, "arguments", None) and any(t.arguments):
-                    if t.style is renpy.display.displayable.default_style:
-                        t.style = renpy.style.Style("default")
-                    Displayable.set_style_prefix(t, prefix, False)
-                    renpy.display.render.redraw(t, 0)
-
-        def _handles_event(self, event: str) -> bool:
-            """Report whether ``self.child`` handles the given transform
-            event (``hide``/`replaced`).
-
-            Args:
-                event (str): The transform event name.
+                child (Displayable): New replacement displayable passed
+                    by SceneLists.add.
 
             Returns:
-                bool: ``True`` if ``self.child`` handles ``event``,
-                    ``False`` otherwise.
+                Displayable: Either child if already wrapped in
+                    ActiveImage, or a new ActiveImage preserving inner
+                    button transforms and focus state.
             """
-            return self.child is not None and self.child._handles_event(event)
+            if isinstance(child, ActiveImage):
+                return child
+            if self.child is not None:
+                self.child.get_placement()
+            _, old_btn, _ = split_transform_chain(self.child)
+            rv = ActiveImage(
+                chain_transforms(old_btn, child, copy=True),
+                layer_key=self.layer_key,
+                **self.btn_kwargs,
+            )
+            transfer_active_state(self, rv)
+            return rv
+
+        def visit(self) -> list[Displayable | None]:
+            """Clear any temporary 'replaced$' SceneListEntry once the
+            replacement entry is active.
+
+            After SceneLists.add inserts a replacement entry updated via
+            _change_transform_child, it calls thing.visit_all(lambda d:
+            None). Removing the 'replaced$' entry here cleans it up
+            synchronously without requiring external state or extra
+            callbacks.
+
+            Returns:
+                list[Displayable | None]: Child displayables visited by
+                    Button.visit.
+            """
+            if self.layer_key is not None and (ctx := renpy.game.context()) is not None:
+                if get_sle(*self.layer_key) is not None:
+                    ctx.scene_lists.remove_hide_replaced(*self.layer_key)
+            return super().visit()
+
+        def _handles_event(self, event: str) -> bool:
+            """Report that ActiveImage handles 'replaced' events during
+            SceneLists.hide_or_replace.
+            """
+            return event == "replaced"
 
         def _hide(self, st: float, at: float, kind: str) -> Displayable | None:
-            """Transition into a locked non-interactive state while
-            ``self.child`` plays ``on hide:``.
+            """Preserve this ActiveImage in a 'replaced$' entry during
+            SceneLists replacement.
+
+            Called by SceneLists.hide_or_replace before an entry is
+            removed or replaced. Returning self when kind is 'replaced'
+            instructs SceneLists.hide_or_replace to keep a temporary
+            'replaced$' entry on the layer so either ActiveImage.visit
+            (when no new transforms are applied) or sync_active_images
+            (when new transforms are applied) can clean up or re-wrap
+            the replacement entry.
 
             Args:
                 st (float): Shown time in seconds.
                 at (float): Animation time in seconds.
-                kind (str): Hide kind (``"hide"`` or ``"replaced"``).
+                kind (str): Hide operation kind ('hide', 'replaced', or
+                    'cancel').
 
             Returns:
-                Displayable | None: A locked copy of ``self`` wrapping
-                    the hiding child, or ``None`` once complete.
+                Displayable | None: Self when kind is 'replaced',
+                    otherwise None.
             """
-            if self.child is None or (new_child := self.child._hide(st, at, kind)) is None:
-                return None
-            rv = self._copy()
-            rv.children = [new_child]
-            rv.child = new_child
-            rv.offsets = []
-            rv.focusable = False
-            rv.locked = True
-            return rv
+            if kind == "replaced" and self.layer_key is not None:
+                if self.child is not None:
+                    self.child.get_placement()
+                return self
+            return None
 
-        def _in_current_store(self) -> Self:
-            """Return a locked, non-focusable copy of ``self`` with
-            children bound to the current store.
+        def get_placement(self) -> tuple:
+            """Delegate placement queries to the wrapped child
+            displayable.
 
-            Used by Ren'Py during ``with`` transitions and ``hide``
-            animations so outgoing snapshots cannot be hovered or
-            clicked.
+            Button inherits Window placement defaults, which would
+            override an ImageReference's image_placement style unless
+            delegated to child.
 
             Returns:
-                Self: A locked copy of ``self``.
+                tuple: Placement tuple (xpos, ypos, xanchor, yanchor,
+                    xoffset, yoffset, subpixel) from the child
+                    displayable.
             """
-            rv = super()._in_current_store()
-            rv.children = [i._in_current_store() for i in self.children]
-            if rv.children:
-                rv.child = rv.children[-1]
-            rv.offsets = []
-            return rv
+            return (
+                self.child.get_placement() if self.child is not None else super().get_placement()
+            )
 
-        def _change_transform_child(self, child: Displayable) -> Displayable:
-            """Update the leaf displayable when ``SceneLists.add``
-            replaces a shown tag.
+        def set_style_prefix(self, prefix: str, root: bool) -> None:
+            """Propagate button style prefixes only when triggered by
+            ActiveImage itself.
 
-            Handles two cases:
-            1. ``child`` is a new ``ActiveImage`` from ``activate``: transfer ``role``,
-                ``last_button_event``, and focus replacement mapping onto ``child``.
-            2. ``child`` is a leaf displayable from a normal ``show``, character callback,
-                or dialogue attribute change: clone ``self`` around ``child`` while
-                preserving button properties and focus state.
+            Outer scene transforms call set_style_prefix with
+            root=False; ignoring those prevents outer transforms from
+            overwriting the button's own hover_ or idle_ prefix. Any
+            descendant still referencing Ren'Py's shared default_style
+            is given its own Style('default') instance first so
+            default_style is never mutated.
 
             Args:
-                child (Displayable): The new displayable passed to
-                    ``SceneLists.add``.
+                prefix (str): Style prefix string (such as 'hover_' or
+                    'idle_').
+                root (bool): True when initiated directly by this
+                    button's focus state.
+            """
+            if root:
+                default_style = renpy.display.displayable.default_style
+                self.visit_all(
+                    lambda d: (
+                        setattr(d, "style", renpy.style.Style("default"))
+                        if d.style is default_style
+                        else None
+                    )
+                )
+                super().set_style_prefix(prefix, root)
+
+        def set_transform_event(self, event: str) -> None:
+            """Forward scene-list lifecycle transform events to inner
+            transforms selectively.
+
+            Container does not forward 'show', 'replace', or 'replaced'
+            to its children, whereas unconditional forwarding would
+            overwrite 'hover' or 'idle' on inner button transforms that
+            do not handle scene events. This override forwards scene
+            lifecycle events only when an inner transform explicitly
+            defines an ATL handler for them.
+
+            Args:
+                event (str): Transform event name (such as 'show',
+                    'replace', 'hover', 'idle').
+            """
+            super().set_transform_event(event)
+            if event in ("show", "replace", "replaced") and self.child is not None:
+                if any(transform_handles_event(n, (event,)) for n in iter_chain(self.child)):
+                    self.child.set_transform_event(event)
+
+        def focus(self, default: bool = False) -> Any:
+            """Handle focus gain and schedule a redraw across the inner
+            transform chain.
+
+            Args:
+                default (bool, default=False): True when restoring
+                    initial focus without firing hovered.
 
             Returns:
-                Displayable: The updated ``ActiveImage`` preserving
-                    button and focus continuity.
+                Any: Result of the hovered action if executed, otherwise
+                    None.
             """
-            if isinstance(child, ActiveImage):
-                return transfer_active_state(self, child)
+            rv = super().focus(default)
+            self.visit_all(lambda d: renpy.display.render.redraw(d, 0))
+            return rv
 
-            rv = self._copy()
-            rv.set_child(child, duplicate=False)
-            return transfer_active_state(self, rv, copy_role=False)
+        def unfocus(self, default: bool = False) -> None:
+            """Handle focus loss while preserving initial
+            'show'/'replace' ATL events.
+
+            Button.unfocus unconditionally sets the 'idle' transform
+            event on its child, which would abort an inner transform's
+            'on show:' or 'on replace:' animation during initial scene
+            setup (default=True). When such an event is pending, this
+            calls Window.unfocus directly.
+
+            Args:
+                default (bool, default=False): True when setting initial
+                    unfocused state without firing unhovered.
+            """
+            ev = getattr(self.child, "transform_event", None)
+            keep_ev = (
+                default
+                and self.is_sensitive()
+                and ev in ("show", "replace")
+                and any(transform_handles_event(n, (ev,)) for n in iter_chain(self.child))
+            )
+            (super(Button, self) if keep_ev else super()).unfocus(default)
+            self.visit_all(lambda d: renpy.display.render.redraw(d, 0))
+
+        def render(self, width: int, height: int, st: float, at: float) -> Render:
+            """Render the child sprite directly and register an
+            occlusion-aware focus mask.
+
+            Button.render uses Window layout (adding window padding,
+            background, and sizing), which is unsuitable for scene-list
+            sprites. This method renders the child directly like an
+            image while registering a focus rectangle tightened to the
+            visible sprite bounds and wrapped with scene-layer occlusion
+            checking.
+
+            Args:
+                width (int): Available horizontal space in pixels.
+                height (int): Available vertical space in pixels.
+                st (float): Shown time in seconds.
+                at (float): Animation time in seconds.
+
+            Returns:
+                Render: Render surface containing the child sprite and
+                    focus region.
+            """
+            surf = renpy.display.render.render(self.child, width, height, st, at)
+            sw, sh = surf.get_size()
+            rv = Render(sw, sh)
+            rv.blit(surf, (0, 0))
+            self.offsets = [(0, 0)]
+            if self.is_sensitive():
+                b = get_render_content_bounds(surf)
+                bx0, by0, bx1, by1 = (
+                    (max(0.0, b[0]), max(0.0, b[1]), min(float(sw), b[2]), min(float(sh), b[3]))
+                    if b
+                    else (0.0, 0.0, float(sw), float(sh))
+                )
+                base_mask = render_focus_mask(self.style.focus_mask, sw, sh, st, at, surf)
+                mask = (
+                    (
+                        lambda mx, my: (
+                            is_render_opaque(base_mask, mx, my)
+                            if isinstance(base_mask, Render)
+                            else base_mask(mx, my)
+                        )
+                        and not is_pixel_occluded(rv, mx, my)
+                    )
+                    if base_mask is not None
+                    else None
+                )
+                fmx, fmy = (0, 0) if mask is not None else (None, None)
+                rv.add_focus(
+                    self, None, bx0, by0, max(1.0, bx1 - bx0), max(1.0, by1 - by0), fmx, fmy, mask
+                )
+            return rv
 
 
-    ###########################################################################
-    # Creator-defined statements (`activate`, `deactivate`, and `call active`)
-    ###########################################################################
+    # --- Transform Hierarchy & SceneLists Integration ------------------------
 
-    BUTTON_CLAUSES: tuple[str, ...] = (
-        "action",
-        "hovered",
-        "unhovered",
-        "alternate",
-        "sensitive",
-        "selected",
-        "focus_mask",
-    )
+
+    def iter_chain(d: Displayable | None) -> Iterator[Displayable]:
+        """Yield each displayable along a single-child wrapper chain.
+
+        Args:
+            d (Displayable | None): Root displayable of the chain.
+
+        Yields:
+            Displayable: Each displayable from root to leaf.
+        """
+        while d is not None:
+            yield d
+            d = getattr(d, "child", None)
+
+
+    def get_sle(layer: str, key: str) -> SceneListEntry | None:
+        """Return the latest SceneListEntry for tag key on layer, or
+        None.
+
+        Args:
+            layer (str): Scene layer name.
+            key (str): Image tag to look up.
+
+        Returns:
+            SceneListEntry | None: Matching entry on the layer if
+                present.
+        """
+        layers = renpy.game.context().scene_lists.layers.get(layer, ())
+        return next((sle for sle in reversed(layers) if sle.tag == key), None)
+
+
+    def find_active_image(d: Displayable | None) -> ActiveImage | None:
+        """Find the ActiveImage instance inside a displayable wrapper
+        chain.
+
+        Args:
+            d (Displayable | None): Root displayable to search.
+
+        Returns:
+            ActiveImage | None: The wrapped ActiveImage if present, else
+                None.
+        """
+        return next((n for n in iter_chain(d) if isinstance(n, ActiveImage)), None)
+
+
+    def transform_handles_event(d: Displayable | None, events: Iterable[str]) -> bool:
+        """Check whether an ATLTransform's compiled block handles any of
+        events.
+
+        Args:
+            d (Displayable | None): Displayable (typically an
+                ATLTransform) to inspect.
+            events (Iterable[str]): Transform event names to check for.
+
+        Returns:
+            bool: True if d is an ATLTransform with a handler for any
+                given event.
+        """
+        block = (d.get_block() or d.compile()) if isinstance(d, ATLTransform) else None
+        return block is not None and any(block._handles_event(ev) for ev in events)
+
+
+    def is_button_transform(t: Any) -> bool:
+        """Classify whether a Transform belongs inside ActiveImage
+        (button transform).
+
+        A transform is treated as an inner button transform if it
+        responds to button container events (such as 'hover' or 'idle'
+        in config.containers_pass_transform_events) or receives keyword
+        arguments. Otherwise it is treated as an outer scene transform.
+
+        Args:
+            t (Any): Transform to classify.
+
+        Returns:
+            bool: True if t should be placed inside ActiveImage, False
+                if outside.
+        """
+        args = getattr(t, "arguments", None)
+        return bool(args and any(k != "" for k in args)) or transform_handles_event(
+            t, renpy.config.containers_pass_transform_events
+        )
+
+
+    def split_transform_chain(
+        d: Displayable | None,
+    ) -> tuple[list[Transform], list[Transform], Displayable | None]:
+        """Partition a displayable chain into outer scene transforms,
+        inner button transforms, and leaf.
+
+        Args:
+            d (Displayable | None): Displayable wrapped in zero or more
+                Transforms (and optionally an ActiveImage).
+
+        Returns:
+            tuple[list[Transform], list[Transform], Displayable | None]:
+                A 3-tuple of (scene_transforms, button_transforms,
+                leaf_displayable) ordered from innermost to outermost so
+                chain_transforms can rebuild them bottom-up.
+        """
+        scene_chain: list[Transform] = []
+        button_chain: list[Transform] = []
+        in_button = False
+        curr = d
+        while curr is not None:
+            if isinstance(curr, ActiveImage):
+                in_button = True
+                curr = curr.child
+            elif isinstance(curr, Transform) and curr.child is not None:
+                (button_chain if (in_button or is_button_transform(curr)) else scene_chain).append(
+                    curr
+                )
+                curr = curr.child
+            else:
+                break
+        return scene_chain[::-1], button_chain[::-1], curr
+
+
+    def chain_transforms(
+        transforms: list[Transform], leaf: Displayable, copy: bool = False
+    ) -> Displayable:
+        """Wrap leaf in a sequence of Transforms from innermost to
+        outermost.
+
+        Args:
+            transforms (list[Transform]): List of Transforms ordered
+                from innermost to outermost.
+            leaf (Displayable): Innermost displayable to wrap.
+            copy (bool, default=False): If True, copy each Transform
+                (preserving its state) before attaching.
+
+        Returns:
+            Displayable: Root of the constructed transform chain.
+        """
+        curr: Displayable = leaf
+        for t in transforms:
+            if copy:
+                t.get_placement()
+                t = t.copy()
+            t.set_child(curr, duplicate=False)
+            t._unique()
+            curr = t
+        return curr
+
+
+    def transfer_active_state(old_widget: ActiveImage, new_widget: ActiveImage) -> None:
+        """Transfer focus replacement mapping and hover/idle state to a
+        replacement ActiveImage.
+
+        Registers old_widget -> new_widget in
+        renpy.display.focus.replaced_by so Ren'Py's focus system
+        recognizes new_widget as the same logical button across
+        interactions, and applies the matching focus/unfocus state.
+
+        Args:
+            old_widget (ActiveImage): Previous ActiveImage being
+                replaced on the layer.
+            new_widget (ActiveImage): Newly created ActiveImage
+                replacing it.
+        """
+        new_widget.role = old_widget.role
+        replaced_by = renpy.display.focus.replaced_by
+        for k, v in list(replaced_by.items()):
+            if v is old_widget:
+                replaced_by[k] = new_widget
+        replaced_by[id(old_widget)] = new_widget
+        if "hover_" in (old_widget.style.prefix or ""):
+            new_widget.focus(default=True)
+        else:
+            new_widget.unfocus(default=True)
+
+
+    def wrap_sle_active(
+        layer: str,
+        key: str,
+        sle: Any,
+        old_active: ActiveImage | None = None,
+        old_btn: list[Transform] = [],
+        new_btn: list[Transform] = [],
+        btn_kwargs: dict[str, Any] | None = None,
+        op: str = "activate",
+    ) -> None:
+        """Wrap or unwrap a SceneListEntry's displayable with an
+        ActiveImage.
+
+        Partitions the entry's transform chain into outer scene
+        transforms and inner button transforms, transitions inner button
+        transform state via SceneLists.transform_state, and either
+        inserts an ActiveImage between the outer and inner chains (when
+        activating or updating) or strips ActiveImage while preserving
+        all transforms (when deactivating).
+
+        Args:
+            layer (str): Scene layer name.
+            key (str): Image tag or key on the layer.
+            sle (Any): SceneListEntry on the layer to update in place.
+            old_active (ActiveImage | None, default=None): Previous
+                ActiveImage on this tag, if any.
+            old_btn (list[Transform], default=[]): Previous inner button
+                transforms from old_active or prior entry.
+            new_btn (list[Transform], default=[]): New inner button
+                transforms to apply.
+            btn_kwargs (dict[str, Any] | None, default=None): Evaluated
+                Button keyword arguments from an 'activate' statement.
+            op (str, default="activate"): Operation mode ('activate' or
+                'deactivate').
+        """
+        sls = renpy.exports.scene_lists()
+        sle.displayable.get_placement()
+        if old_active is not None and old_active.child is not None:
+            old_active.child.get_placement()
+            if not old_btn:
+                _, old_btn, _ = split_transform_chain(old_active.child)
+
+        new_scene, sle_btn, leaf = split_transform_chain(sle.displayable)
+        new_btn = new_btn or sle_btn
+        if leaf is None:
+            return
+        old_inner = chain_transforms(old_btn, leaf, copy=True) if old_btn else None
+        inner_d = (
+            sls.transform_state(old_inner, chain_transforms(new_btn, leaf), execution=True)
+            if new_btn
+            else (old_inner or leaf)
+        )
+
+        merged_kwargs = {**(old_active.btn_kwargs if old_active else {}), **(btn_kwargs or {})}
+        active_img = ActiveImage(inner_d, layer_key=(layer, key), **merged_kwargs)
+        if op == "deactivate":
+            was_focused = (
+                old_active is not None and renpy.display.focus.get_focused() is old_active
+            )
+            active_img.unfocus(default=not was_focused)
+            sle.displayable = chain_transforms(new_scene, active_img.child)
+            return
+
+        sle.displayable = (
+            chain_transforms(new_scene, active_img) if new_scene else Transform(child=active_img)
+        )
+        if key in sls.at_list[layer]:
+            sls.at_list[layer][key] = [
+                t for t in sls.at_list[layer][key] if not is_button_transform(t)
+            ]
+        if old_active is not None:
+            transfer_active_state(old_active, active_img)
+        else:
+            active_img.unfocus(default=True)
+
+
+    def sync_active_images(_stmt: str | None = None) -> None:
+        """Re-wrap any active images replaced by native 'show'
+        statements with transforms.
+
+        When a native 'show' statement without 'at' or ATL replaces an
+        active image, SceneLists.add calls
+        ActiveImage._change_transform_child and ActiveImage.visit cleans
+        up the temporary 'replaced$' entry. When a native 'show'
+        statement includes 'at' or ATL, SceneLists.hide_or_replace
+        retains the old ActiveImage in a 'replaced$' SceneListEntry so
+        this callback can re-wrap the updated entry and transfer focus
+        state.
+
+        Args:
+            _stmt (str | None, default=None): Optional statement name
+                passed by config.statement_callbacks.
+        """
+        if (ctx := renpy.game.context()) is None:
+            return
+        sls = ctx.scene_lists
+        for layer, entries in list(sls.layers.items()):
+            for sle in list(entries):
+                if (
+                    sle.tag
+                    and sle.tag.startswith("replaced$")
+                    and (old_active := find_active_image(sle.displayable)) is not None
+                ):
+                    key = sle.tag.partition("$")[2]
+                    sls.remove_hide_replaced(layer, key)
+                    if (new_sle := get_sle(layer, key)) is not None and find_active_image(
+                        new_sle.displayable
+                    ) is None:
+                        if getattr(new_sle.displayable, "transform_event", None) == "replace":
+                            wrap_sle_active(
+                                layer, key, new_sle, old_active=old_active, op="activate"
+                            )
+
+
+    # --- Custom Statements: activate, deactivate, and call active ------------
 
 
     def parse_activate_or_deactivate(
         l: Lexer, allow_button_clauses: bool = True
     ) -> dict[str, Any]:
-        """Parse an ``activate`` or ``deactivate`` statement.
+        """Parse an 'activate' or 'deactivate' statement into an imspec
+        and button clauses.
 
-        Temporarily extends ``IMAGE_KEYWORDS`` with ``BUTTON_CLAUSES``
-        so ``parse_image_specifier`` stops before button properties
-        (``action``, ``hovered``, etc.).
+        Uses Ren'Py's native parse_image_specifier for the leading image
+        and show clauses, then continues parsing interspersed button
+        clauses (for 'activate') and trailing show/with clauses in any
+        order.
 
         Args:
-            l (Lexer): The Ren'Py script lexer.
-            allow_button_clauses (bool, default=True): ``True`` for
-                ``activate``, ``False`` for ``deactivate``.
+            l (Lexer): Ren'Py script lexer positioned after the
+                statement keyword.
+            allow_button_clauses (bool, default=True): True for
+                'activate', False for 'deactivate'.
 
         Returns:
-            dict[str, Any]: A dict containing ``"imspec"``,
-                ``"with_expr"``, and ``"button_clauses"``.
+            dict[str, Any]: Parsed statement dictionary containing
+                'imspec', 'button_clauses', and 'with_expr'.
         """
         stmt = "activate" if allow_button_clauses else "deactivate"
-        old_keywords = renpy.lexer.IMAGE_KEYWORDS
-        try:
-            if allow_button_clauses:
-                renpy.lexer.IMAGE_KEYWORDS = tuple(old_keywords) + BUTTON_CLAUSES
-            imspec = renpy.parser.parse_image_specifier(l)
-        finally:
-            renpy.lexer.IMAGE_KEYWORDS = old_keywords
+        name, expression, tag, at_list, layer, zorder, behind = parse_image_specifier(l)
+        clauses: dict[str, Any] = {
+            "at": list(at_list),
+            "as": tag,
+            "onlayer": layer,
+            "zorder": zorder,
+            "behind": list(behind or ()),
+            "with": None,
+        }
+        button_clauses: dict[str, str] = {}
 
-        with_expr = None
-        button_clauses = {}
-
-        while True:
-            if l.keyword("with"):
-                if with_expr is not None:
-                    l.error(f"{stmt} statement given multiple with clauses.")
-                with_expr = l.require(l.simple_expression)
-            elif allow_button_clauses and (
-                kw := next((k for k in BUTTON_CLAUSES if l.keyword(k)), None)
-            ):
-                if kw in button_clauses:
-                    l.error(f"{stmt} statement given multiple {kw} clauses.")
-                button_clauses[kw] = l.require(l.simple_expression)
+        while not l.eol() and not l.match(":"):
+            pos = l.checkpoint()
+            if not (word := l.word()):
+                l.error(f"expected clause in {stmt} statement.")
+            if word in clauses:
+                if clauses[word]:
+                    l.error(f"duplicate '{word}' clause in {stmt} statement.")
+                if word == "at":
+                    clauses["at"] = list(parse_simple_expression_list(l, image=True))
+                elif word == "behind":
+                    while True:
+                        clauses["behind"].append(l.require(l.name))
+                        if not l.match(","):
+                            break
+                elif word == "as":
+                    clauses["as"] = l.require(l.name)
+                elif word == "onlayer":
+                    clauses["onlayer"] = l.require(l.image_name_component)
+                else:
+                    clauses[word] = l.require(l.simple_expression)
+            elif allow_button_clauses and word in BUTTON_CLAUSES:
+                if word in button_clauses:
+                    l.error(f"duplicate '{word}' clause in {stmt} statement.")
+                button_clauses[word] = l.require(l.simple_expression)
             else:
-                break
+                l.revert(pos)
+                l.error(f"unexpected clause '{word}' in {stmt} statement.")
 
-        if l.match(":"):
-            l.expect_block(f"{stmt} statement")
-        else:
-            l.expect_noblock(f"{stmt} statement")
+        imspec = (
+            name,
+            expression,
+            clauses["as"],
+            clauses["at"],
+            clauses["onlayer"],
+            clauses["zorder"],
+            clauses["behind"],
+        )
+        return {"imspec": imspec, "button_clauses": button_clauses, "with_expr": clauses["with"]}
 
-        l.expect_eol()
-        return {"imspec": imspec, "with_expr": with_expr, "button_clauses": button_clauses}
 
+    def execute_activate_or_deactivate(
+        p: dict[str, Any], atl: Any = None, op: str = "activate"
+    ) -> None:
+        """Execute a parsed 'activate' or 'deactivate' statement.
 
-    def execute_activate(p: dict[str, Any], atl: Any = None) -> None:
-        """Execute the ``activate`` statement.
-
-        Wraps the target leaf image in an ``ActiveImage`` button
-        (inheriting unspecified button clauses if the tag is already
-        active) and delegates showing and any ``at``/ATL transform
-        wrapping to ``renpy.exports.show``.
+        Unwraps any existing ActiveImage or inner button transforms on
+        the target tag so Ren'Py's native show transitions outer scene
+        transforms cleanly, calls renpy.config.show, and wraps or
+        unwraps the resulting entry via wrap_sle_active.
 
         Args:
             p (dict[str, Any]): Parsed statement dictionary from
-                ``parse_activate_or_deactivate``.
-            atl (Any, default=None): Optional compiled ATL transform
-                block attached to the statement.
+                parse_activate_or_deactivate.
+            atl (Any, default=None): Optional compiled ATLTransform
+                attached to the statement.
+            op (str, default="activate"): Operation type ('activate' or
+                'deactivate').
         """
-        name, expression, what, tag, key, at_vals, resolved_layer, zorder, behind = resolve_imspec(
-            p["imspec"]
-        )
-        with_expr = p["with_expr"]
-
-        if with_expr is not None:
+        if (with_expr := p["with_expr"]) is not None:
             renpy.exports.with_statement(None)
 
-        sle = get_sle(resolved_layer, key)
-        existing_active = find_active_image(sle.displayable) if sle is not None else None
-        new_name, leaf_img = resolve_target_image(name, expression, what, key, resolved_layer, sle)
+        name, expression, tag, at_list, layer, zorder, behind = p["imspec"]
+        zorder = renpy.python.py_eval(zorder) if zorder is not None else None
+        what = None
+        if expression is not None:
+            what = renpy.python.py_eval(expression)
+            if not renpy.config.old_show_expression:
+                if isinstance(what, str):
+                    name = what
+                else:
+                    if tag is None:
+                        tag = next(
+                            t
+                            for i in itertools.count()
+                            if not renpy.exports.showing(t := f"_show_expression_{i}", layer)
+                        )
+                    name = tag
+            what = renpy.easy.displayable(what)
 
-        btn_kwargs = {kw: renpy.python.py_eval(expr) for kw, expr in p["button_clauses"].items()}
-        if existing_active is not None:
-            for kw in BUTTON_CLAUSES:
-                if kw not in btn_kwargs:
-                    btn_kwargs[kw] = (
-                        existing_active.style.focus_mask
-                        if kw == "focus_mask"
-                        else getattr(existing_active, kw)
-                    )
-        else:
-            btn_kwargs.setdefault("action", renpy.store.NullAction())
-            btn_kwargs.setdefault("focus_mask", True)
+        eval_at = [renpy.python.py_eval(i) for i in at_list]
+        name = name if isinstance(name, tuple) else tuple(name.split())
+        key = tag or name[0]
+        layer = renpy.exports.default_layer(layer, key, bool(expression) and (tag is None))
+        sls = renpy.exports.scene_lists()
+        old_sle = get_sle(layer, key)
 
-        active_img = ActiveImage(
-            child=leaf_img, focus_name=f"active_image:{resolved_layer}:{key}", **btn_kwargs
-        )
-        if existing_active is not None:
-            transfer_active_state(existing_active, active_img)
-
-        renpy.exports.show(
-            new_name,
-            at_list=at_vals,
-            layer=resolved_layer,
-            what=active_img,
-            zorder=zorder,
-            tag=tag,
-            behind=behind,
-            atl=atl,
-        )
-
-        if (
-            isinstance(default_transform := renpy.config.default_transform, Transform)
-            and (new_sle := get_sle(resolved_layer, key)) is not None
-            and isinstance(new_sle.displayable, Transform)
-        ):
-            state = new_sle.displayable.state
-            for pos_attr, inh_attr, val in zip(
-                ("xpos", "ypos", "xanchor", "yanchor"),
-                ("inherited_xpos", "inherited_ypos", "inherited_xanchor", "inherited_yanchor"),
-                default_transform.get_placement()[:4],
-            ):
-                if (
-                    getattr(state, pos_attr, None) is None
-                    and getattr(state, inh_attr, None) is None
-                    and val is not None
-                ):
-                    setattr(state, inh_attr, val)
-
-        if with_expr is not None:
-            renpy.exports.with_statement(renpy.python.py_eval(with_expr))
-
-
-    def execute_deactivate(p: dict[str, Any], atl: Any = None) -> None:
-        """Execute the ``deactivate`` statement.
-
-        Removes the ``ActiveImage`` wrapper from the target sprite while
-        preserving its outer ``Transform`` chain, transitions enclosing
-        hover transforms back to ``"idle"``, and applies any optional
-        ``show`` clauses or ATL block. No-ops if the target tag is not
-        currently showing.
-
-        Args:
-            p (dict[str, Any]): Parsed statement dictionary from
-                ``parse_activate_or_deactivate``.
-            atl (Any, default=None): Optional compiled ATL transform
-                block attached to the statement.
-        """
-        name, expression, what, tag, key, at_vals, resolved_layer, zorder, behind = resolve_imspec(
-            p["imspec"]
-        )
-        with_expr = p["with_expr"]
-
-        if not renpy.exports.showing(key, layer=resolved_layer):
+        if op == "deactivate" and old_sle is None:
+            if with_expr is not None:
+                renpy.exports.with_statement(renpy.python.py_eval(with_expr))
             return
 
-        if with_expr is not None:
-            renpy.exports.with_statement(None)
+        old_active = find_active_image(old_sle.displayable) if old_sle is not None else None
+        old_btn: list[Transform] = []
+        if old_sle is not None:
+            old_sle.displayable.get_placement()
+            old_scene, old_btn, old_leaf = split_transform_chain(old_sle.displayable)
+            if what is None and old_leaf is not None:
+                if (
+                    isinstance(old_leaf, ImageReference)
+                    and isinstance(old_leaf.name, tuple)
+                    and old_leaf.name
+                ):
+                    if (
+                        name[0] == key != old_leaf.name[0]
+                        and renpy.display.image.images.get(name) is None
+                        and not renpy.display.image.image_attributes.get(key)
+                    ):
+                        name, tag = (old_leaf.name[0],) + name[1:], key
+                elif not isinstance(old_leaf, ImageReference) and name == (key,):
+                    what = old_leaf
+            if (old_active is not None or old_btn) and old_leaf is not None:
+                sle_copy = old_sle.copy()
+                sle_copy.displayable = chain_transforms(old_scene, old_leaf, copy=True)
+                sls.layers[layer][sls.layers[layer].index(old_sle)] = sle_copy
 
-        sle = get_sle(resolved_layer, key)
-        existing_active = find_active_image(sle.displayable) if sle is not None else None
-        new_name, leaf_img = resolve_target_image(name, expression, what, key, resolved_layer, sle)
+        scene_at = [t for t in eval_at if not is_button_transform(t)]
+        btn_at = [
+            t() if isinstance(t, Transform) else t for t in eval_at if is_button_transform(t)
+        ]
+        if atl is not None and is_button_transform(atl):
+            btn_at.append(atl)
+            scene_atl = None
+        else:
+            scene_atl = atl
 
-        if sle is not None and existing_active is not None:
-            sle_copy = sle.copy()
-            sle_copy.displayable = unwrap_active_image(sle.displayable)
-            layer_list = renpy.game.context().scene_lists.layers[resolved_layer]
-            layer_list[layer_list.index(sle)] = sle_copy
-
-        renpy.exports.show(
-            new_name,
-            at_list=at_vals,
-            layer=resolved_layer,
-            what=leaf_img,
+        btn_kwargs = {kw: renpy.python.py_eval(expr) for kw, expr in p["button_clauses"].items()}
+        renpy.config.show(
+            name,
+            at_list=scene_at,
+            layer=layer,
+            what=what,
             zorder=zorder,
             tag=tag,
             behind=behind,
-            atl=atl,
+            atl=scene_atl,
         )
-
-        if existing_active is not None and (new_sle := get_sle(resolved_layer, key)) is not None:
-            d = new_sle.displayable
-            while isinstance(d, Transform):
-                block = (d.get_block() or d.compile()) if hasattr(d, "get_block") else None
-                if block is None or not block._handles_event(d.transform_event):
-                    d.transform_event = "idle"
-                if d.style is not renpy.display.displayable.default_style:
-                    Displayable.set_style_prefix(d, "idle_", False)
-                d = d.child
+        sls.remove_hide_replaced(layer, key)
+        if (new_sle := get_sle(layer, key)) is not None:
+            wrap_sle_active(
+                layer,
+                key,
+                new_sle,
+                old_active=old_active,
+                old_btn=old_btn,
+                new_btn=btn_at,
+                btn_kwargs=btn_kwargs,
+                op=op,
+            )
 
         if with_expr is not None:
             renpy.exports.with_statement(renpy.python.py_eval(with_expr))
 
 
-    def predict_activate_or_deactivate(p: dict[str, Any]) -> list[Any]:
-        """Predict displayables referenced by ``activate`` or
-        ``deactivate``.
+    def lint_activate_or_deactivate(p: dict[str, Any], stmt: str = "activate") -> None:
+        """Validate image specifiers and clause expressions during
+        'renpy lint'.
+
+        Delegates image, layer, and at-list checking to Ren'Py's native
+        check_show (treating single-word tags already registered in
+        renpy.lint.image_prefixes as valid tag references), then
+        validates all Python expressions in button, zorder, and with
+        clauses.
 
         Args:
-            p (dict[str, Any]): Parsed statement dictionary.
-
-        Returns:
-            list[Any]: An empty list (prediction is registered via
-                ``predict_imspec``).
-        """
-        renpy.ast.predict_imspec(p["imspec"])
-        return []
-
-
-    def lint_activate_or_deactivate(p: dict[str, Any], is_deactivate: bool = False) -> None:
-        """Validate layers, images, transforms, and button expressions
-        during lint.
-
-        Args:
-            p (dict[str, Any]): Parsed statement dictionary.
-            is_deactivate (bool, default=False): ``True`` when linting
-                ``deactivate``, ``False`` when linting ``activate``.
+            p (dict[str, Any]): Parsed statement dictionary from
+                parse_activate_or_deactivate.
+            stmt (str, default="activate"): Statement name ('activate'
+                or 'deactivate') for lint messages.
         """
         name, expression, tag, at_list, layer, zorder, behind = p["imspec"]
-        stmt = "deactivate" if is_deactivate else "activate"
-        key = tag or (name[0] if name else None)
-
-        resolved_layer = renpy.exports.default_layer(layer, key, expression is not None)
-        if resolved_layer not in renpy.display.scenelists.layers:
-            renpy.lint.report("Uses layer '%s', which is not defined.", resolved_layer)
-
-        if expression is not None:
-            if key is not None:
-                renpy.lint.image_prefixes[key] = True
-            renpy.lint.try_eval(f"the expression of a {stmt} statement", expression)
-        elif is_deactivate:
-            if key not in renpy.lint.image_prefixes:
-                renpy.lint.report(
-                    "The image tag '%s' is not the prefix of a declared image, nor was it used in"
-                    " a show statement before this deactivate statement.",
-                    key,
-                )
-        else:
-            renpy.lint.image_exists(name, expression, tag, precise=False)
-
-        if zorder is not None:
-            renpy.lint.try_eval(f"the zorder of a {stmt} statement", zorder)
-
-        for expr in at_list:
-            renpy.lint.try_eval(
-                f"the at list of a {stmt} statement",
-                expr,
-                "Perhaps you forgot to define or misspelled a transform.",
-            )
-
-        for kw, expr in p.get("button_clauses", {}).items():
-            renpy.lint.try_eval(f"the {kw} clause of a {stmt} statement", expr)
-
-        if p.get("with_expr") is not None:
-            renpy.lint.try_eval(f"the with clause of a {stmt} statement", p["with_expr"])
+        is_known_tag = len(name) == 1 and name[0] in renpy.lint.image_prefixes
+        imspec = (
+            name,
+            expression or ("True" if is_known_tag else None),
+            tag,
+            at_list,
+            layer,
+            zorder,
+            behind,
+        )
+        renpy.lint.check_show(Show((None, 0), imspec), False)
+        for kw, expr in (
+            *p["button_clauses"].items(),
+            ("zorder", zorder),
+            ("with", p["with_expr"]),
+        ):
+            if expr is not None:
+                renpy.lint.try_eval(f"the {kw} clause of a {stmt} statement", expr)
 
 
     def parse_call_active(l: Lexer) -> dict[str, Any]:
-        """Parse a ``call active`` statement.
+        """Parse a 'call active' statement and its optional single-Say
+        subblock.
 
-        Supports an optional timeout expression (``call active 5.0``)
-        and an optional single-line ``say`` subblock whose dialogue is
-        displayed without blocking before the pause interaction begins
-        (``subparse.block[0].interact = False``).
+        When a colon subblock is provided, verifies that it contains a
+        single Say statement and sets its interact=False so the dialogue
+        line is displayed on screen while post_execute_call_active runs
+        the modal active-image interaction.
 
         Args:
-            l (Lexer): The Ren'Py script lexer.
+            l (Lexer): Ren'Py script lexer positioned after 'call
+                active'.
 
         Returns:
-            dict[str, Any]: A dict with ``"delay"`` (expression string
-                or ``None``) and ``"subparse"`` (subblock or ``None``).
+            dict[str, Any]: Dictionary with 'delay' expression and
+                'subparse' block.
         """
         delay = l.simple_expression()
-
         subparse = None
         if l.match(":"):
             l.expect_block("call active statement")
@@ -629,44 +911,44 @@ python early in active_images:
             subparse.block[0].interact = False
         else:
             l.expect_noblock("call active statement")
-
         l.expect_eol()
         return {"delay": delay, "subparse": subparse}
 
 
     def execute_call_active(p: dict[str, Any]) -> None:
-        """Prepare rollback and skipping state before ``call active``.
+        """Prepare skipping, rollback, and window state before 'call
+        active' runs.
 
-        Defers `_begin_rollback` until ``post_execute_call_active`` when
-        a ``say`` subblock is present so rolling back returns to the
-        ``call active`` node as a single unit.
+        Defers rollback checkpointing until post_execute_call_active so
+        that any nested non-interactive Say statement and the subsequent
+        active-image interaction share a single rollback checkpoint.
 
         Args:
             p (dict[str, Any]): Parsed statement dictionary from
-                ``parse_call_active``.
+                parse_call_active.
         """
         renpy.exports.choice_for_skipping()
-        renpy.config.skipping = None
+        renpy.exports.stop_skipping()
         renpy.store._begin_rollback = False
-
         if p["subparse"] is None:
             renpy.store._window_auto = True
 
 
     def post_execute_call_active(p: dict[str, Any]) -> None:
-        """Run the interactive pause for ``call active`` after any
-        ``say`` subblock.
+        """Run the active-image pause interaction and store the result
+        in _return.
 
-        Waits for an active sprite action (or timeout ``delay``),
-        checkpoints rollback, and stores the result in
-        ``store._return``.
+        Mirrors renpy.exports.pause closely, but intentionally omits
+        renpy.ui.saybehavior so background clicks or Space/Enter presses
+        do not dismiss the interaction before an active image is clicked
+        or the optional delay expires. Also preserves non-boolean return
+        values across roll-forward and checkpoints the interaction.
 
         Args:
             p (dict[str, Any]): Parsed statement dictionary from
-                ``parse_call_active``.
+                parse_call_active.
         """
         renpy.store._begin_rollback = True
-
         delay = renpy.python.py_eval(p["delay"]) if p["delay"] is not None else None
         roll_forward = renpy.exports.roll_forward_info()
 
@@ -678,61 +960,45 @@ python early in active_images:
             delay = 0
 
         renpy.exports.mode("pause")
-
-        RollForwardState.in_call_active = True
         try:
             rv = renpy.ui.interact(
-                mouse="pause", type="pause", roll_forward=roll_forward, pause=delay
+                mouse="pause", type="call_active", roll_forward=roll_forward, pause=delay
             )
         except (JumpException, CallException) as e:
             rv = e
-        finally:
-            RollForwardState.in_call_active = False
 
         renpy.exports.checkpoint(
             rv, keep_rollback=True, hard=renpy.config.pause_after_rollback or (delay is None)
         )
-
         if renpy.config.implicit_with_none:
             renpy.game.interface.do_with(None, None)
-
         if isinstance(rv, (JumpException, CallException)):
             raise rv
-
         renpy.store._return = rv
 
 
     def lint_call_active(p: dict[str, Any]) -> None:
-        """Validate the optional delay expression of ``call active``.
+        """Validate the optional delay expression of a 'call active'
+        statement.
 
         Args:
             p (dict[str, Any]): Parsed statement dictionary from
-                ``parse_call_active``.
+                parse_call_active.
         """
         if p["delay"] is not None:
             renpy.lint.try_eval("the delay of a call active statement", p["delay"])
 
 
-    renpy.register_statement(
-        "activate",
-        parse=lambda l: parse_activate_or_deactivate(l, allow_button_clauses=True),
-        execute=execute_activate,
-        predict=predict_activate_or_deactivate,
-        lint=lambda p: lint_activate_or_deactivate(p, is_deactivate=False),
-        block="atl-possible",
-        warp=lambda p: True,
-    )
-
-    renpy.register_statement(
-        "deactivate",
-        parse=lambda l: parse_activate_or_deactivate(l, allow_button_clauses=False),
-        execute=execute_deactivate,
-        predict=predict_activate_or_deactivate,
-        lint=lambda p: lint_activate_or_deactivate(p, is_deactivate=True),
-        block="atl-possible",
-        warp=lambda p: True,
-    )
-
+    for _stmt, _allow_btn in (("activate", True), ("deactivate", False)):
+        renpy.register_statement(
+            _stmt,
+            parse=lambda l, b=_allow_btn: parse_activate_or_deactivate(l, allow_button_clauses=b),
+            execute=lambda p, atl=None, op=_stmt: execute_activate_or_deactivate(p, atl, op=op),
+            predict=lambda p: (renpy.ast.predict_imspec(p["imspec"]), [])[1],
+            lint=lambda p, s=_stmt: lint_activate_or_deactivate(p, stmt=s),
+            block="atl-possible",
+            warp=lambda p: True,
+        )
     renpy.register_statement(
         "call active",
         parse=parse_call_active,
@@ -744,690 +1010,278 @@ python early in active_images:
         force_begin_rollback=True,
     )
 
-
-    ###########################################################################
-    # Scene-list, image resolution, and transform state helpers
-    ###########################################################################
-
-
-    def get_sle(layer: str, key: str) -> SceneListEntry | None:
-        """Find the most recent ``SceneListEntry`` for ``key`` on
-        ``layer``.
-
-        Args:
-            layer (str): The target layer name.
-            key (str): The image tag.
-
-        Returns:
-            SceneListEntry | None: The matching ``SceneListEntry``, or
-                ``None`` if ``key`` is not showing on ``layer``.
-        """
-        return next(
-            (
-                sle
-                for sle in reversed(renpy.game.context().scene_lists.layers.get(layer, ()))
-                if sle.tag == key
-            ),
-            None,
-        )
-
-
-    def find_active_image(d: Displayable | None) -> ActiveImage | None:
-        """Find the ``ActiveImage`` in the ``d -> d.child`` transform
-        chain, if any.
-
-        Args:
-            d (Displayable | None): Root displayable of a
-                ``SceneListEntry`` (or ``None``).
-
-        Returns:
-            ActiveImage | None: The matching ``ActiveImage``, or
-                ``None`` if ``d`` is not active.
-        """
-        while d is not None:
-            if isinstance(d, ActiveImage):
-                return d
-            d = getattr(d, "child", None)
-        return None
-
-
-    def iter_enclosing_transforms(target: Displayable) -> list[Transform]:
-        """Return all scene-list ``Transform`` wrappers enclosing
-        ``target``.
-
-        Walks the current context's ``SceneLists`` layers to find any
-        entry whose transform chain contains ``target``, collecting all
-        ``Transform`` instances above ``target``.
-
-        Args:
-            target (Displayable): The ``Displayable`` (typically an
-                ``ActiveImage``) to search for.
-
-        Returns:
-            list[Transform]: A list of ``Transform`` instances enclosing
-                ``target``.
-        """
-        result = []
-        ctx = renpy.game.context()
-        if ctx is None or getattr(ctx, "scene_lists", None) is None:
-            return result
-        for layer_list in ctx.scene_lists.layers.values():
-            for sle in layer_list:
-                transforms = []
-                d = sle.displayable
-                while d is not None:
-                    if d is target:
-                        result.extend(transforms)
-                        break
-                    if isinstance(d, Transform):
-                        transforms.append(d)
-                    d = getattr(d, "child", None)
-        return result
-
-
-    def transfer_active_state(
-        old_widget: ActiveImage, new_widget: ActiveImage, copy_role: bool = True
-    ) -> ActiveImage:
-        """Transfer button state and focus replacement mapping from
-        ``old_widget`` to ``new_widget``.
-
-        When character callbacks, dialogue attribute changes, or
-        ``activate``/``show`` statements replace an ``ActiveImage``
-        mid-interaction, transferring ``role``, ``last_button_event``,
-        and ``replaced_by`` (including transitive chains) preserves
-        hover and focus state across interaction restarts.
-
-        Args:
-            old_widget (ActiveImage): The previous ``ActiveImage``
-                instance being replaced.
-            new_widget (ActiveImage): The new ``ActiveImage`` instance
-                taking its place.
-            copy_role (bool, default=True): Whether to copy
-                ``old_widget.role`` onto ``new_widget``.
-
-        Returns:
-            ActiveImage: ``new_widget`` with state transferred.
-        """
-        if copy_role:
-            new_widget.role = old_widget.role
-        new_widget.last_button_event = old_widget.last_button_event
-        replaced_by = renpy.display.focus.replaced_by
-        for k, v in list(replaced_by.items()):
-            if v is old_widget:
-                replaced_by[k] = new_widget
-        replaced_by[id(old_widget)] = new_widget
-        return new_widget
-
-
-    def inject_active_child(d: Displayable, old_active: ActiveImage) -> Displayable:
-        """Wrap the leaf displayable of ``d`` in a copy of
-        ``old_active``.
-
-        Used by ``preserve_active_transform_state`` when a normal
-        ``show`` statement with ``at`` or ATL blocks replaces the
-        transform chain of an active sprite.
-
-        Args:
-            d (Displayable): The new displayable or ``Transform`` chain
-                being shown.
-            old_active (ActiveImage): The currently active
-                ``ActiveImage`` to preserve.
-
-        Returns:
-            Displayable: ``d`` with its leaf displayable wrapped in a
-                copy of ``old_active``.
-        """
-        if isinstance(d, Transform) and d.child is not None:
-            d.set_child(inject_active_child(d.child, old_active), duplicate=False)
-            return d
-        return old_active._change_transform_child(d)
-
-
-    def unwrap_active_image(d: Displayable) -> Displayable:
-        """Return a copy of ``d``'s transform chain with any
-        ``ActiveImage`` wrapper removed.
-
-        Clones enclosing ``Transform`` instances rather than mutating
-        them in-place so displayables stored in earlier rollback
-        checkpoints remain intact.
-
-        Args:
-            d (Displayable): Root displayable of a ``SceneListEntry``.
-
-        Returns:
-            Displayable: The displayable or ``Transform`` chain with
-                ``ActiveImage`` replaced by its child.
-        """
-        if isinstance(d, ActiveImage):
-            return unwrap_active_image(d.child) if d.child is not None else Null()
-        if isinstance(d, Transform) and d.child is not None:
-            d.get_placement()
-            rv = d.copy()
-            rv.active = d.active
-            rv.set_child(unwrap_active_image(d.child), duplicate=False)
-            rv._unique()
-            return rv
-        return d
-
-
-    def resolve_imspec(
-        imspec: tuple,
-    ) -> tuple[
-        tuple[str, ...],
-        str | None,
-        Displayable | None,
-        str | None,
-        str,
-        list[Any],
-        str,
-        int | None,
-        list[str],
-    ]:
-        """Evaluate runtime expressions in an ``imspec`` tuple and
-        resolve the target tag and layer.
-
-        Handles anonymous ``activate expression`` statements by
-        generating a unique `_show_expression_N` tag when no ``as`` tag
-        is given.
-
-        Args:
-            imspec (tuple): The 7-tuple returned by
-                ``parse_image_specifier``.
-
-        Returns:
-            tuple[tuple[str, ...], str | None, Displayable | None, str | None, str, list[Any], str, int | None, list[str]]:
-                ``(name, expression, what, tag, key, at_vals, resolved_layer, zorder, behind)``.
-        """
-        name, expression, tag, at_list, layer, zorder, behind = imspec
-        zorder = renpy.python.py_eval(zorder) if zorder is not None else None
-        behind = list(behind) if behind is not None else []
-        at_vals = [renpy.python.py_eval(i) for i in at_list]
-
-        if expression is not None:
-            what = renpy.python.py_eval(expression)
-            if not renpy.config.old_show_expression:
-                if isinstance(what, str):
-                    name = tuple(what.split())
-                else:
-                    if tag is None:
-                        i = 0
-                        while renpy.exports.showing(f"_show_expression_{i}", layer=layer):
-                            i += 1
-                        tag = f"_show_expression_{i}"
-                    name = (tag,)
-            what = renpy.easy.displayable(what)
-        else:
-            what = None
-
-        key = tag or name[0]
-        resolved_layer = renpy.exports.default_layer(
-            layer, key, (expression is not None) and (tag is None)
-        )
-        return (name, expression, what, tag, key, at_vals, resolved_layer, zorder, behind)
-
-
-    def resolve_target_image(
-        name: tuple[str, ...],
-        expression: str | None,
-        what: Displayable | None,
-        key: str,
-        resolved_layer: str,
-        sle: SceneListEntry | None = None,
-    ) -> tuple[tuple[str, ...], Displayable]:
-        """Resolve the image name tuple and leaf displayable for
-        ``activate`` or ``deactivate``.
-
-        When updating or deactivating an already-shown tag without
-        ``expression``, inspects the existing leaf displayable in
-        ``sle`` so custom ``as`` tags and ``show expression`` /
-        ``activate expression`` displayables resolve to their actual
-        underlying image or displayable.
-
-        Args:
-            name (tuple[str, ...]): Parsed image name tuple.
-            expression (str | None): Raw expression string if
-                ``expression`` was used, else ``None``.
-            what (Displayable | None): Evaluated expression displayable
-                if ``expression`` was used, else ``None``.
-            key (str): Effective image tag.
-            resolved_layer (str): Target layer name.
-            sle (SceneListEntry | None, default=None): Existing
-                ``SceneListEntry`` for ``(resolved_layer, key)``, if
-                any.
-
-        Returns:
-            tuple[tuple[str, ...], Displayable]:
-                ``(new_name, leaf_displayable)``.
-        """
-        if expression is not None:
-            return (key,) + name[1:], what
-
-        if what is None and sle is not None:
-            d = sle.displayable
-            while isinstance(d, (Transform, ActiveImage)) and d.child is not None:
-                d = d.child
-
-            # Reuse raw displayable if originally shown via `show/activate expression ... as tag`.
-            if d is not None and not isinstance(d, ImageReference):
-                if name == (key,):
-                    return sle.name or name, d
-            # Map custom `as` tag back to the base image tag (e.g. `show/activate eileen as hero`).
-            elif (
-                isinstance(d, ImageReference)
-                and isinstance(d.name, tuple)
-                and d.name
-                and name[0] == key
-                and d.name[0] != key
-                and renpy.display.image.images.get(name) is None
-                and not renpy.display.image.image_attributes.get(key)
-            ):
-                name = (d.name[0],) + name[1:]
-
-        new_name, full_name = renpy.exports.displayexports._find_image(
-            resolved_layer, key, name, None
-        )
-        return (key,) + new_name[1:], ImageReference(full_name, style="image_placement")
-
-
-    orig_transform_state = getattr(
-        SceneLists.transform_state, "orig_transform_state", SceneLists.transform_state
-    )
-
-
-    def preserve_active_transform_state(
-        self: SceneLists,
-        old_thing: Displayable | None,
-        new_thing: Displayable,
-        execution: bool = False,
-    ) -> Displayable:
-        """Wrap ``SceneLists.transform_state`` so normal ``show``
-        statements preserve ``ActiveImage``.
-
-        When an active sprite is updated by a normal ``show`` statement
-        with ``at`` transforms or an ATL block (``execution=False``),
-        injects a copy of the existing ``ActiveImage`` around the new
-        leaf displayable before transferring outer transform state.
-
-        Args:
-            self (SceneLists): The active ``SceneLists`` instance.
-            old_thing (Displayable | None): The previous root
-                displayable on the scene list, or ``None``.
-            new_thing (Displayable): The new root displayable being
-                shown.
-            execution (bool, default=False): Whether ATL execution state
-                is also being transferred.
-
-        Returns:
-            Displayable: ``new_thing`` with transform state (and
-                ``ActiveImage`` wrapper, if active) preserved.
-        """
-        if old_thing is not None:
-            old_thing.get_placement()
-        if not execution and (old_active := find_active_image(old_thing)) is not None:
-            new_active = find_active_image(new_thing)
-            if new_active is None:
-                new_thing = inject_active_child(new_thing, old_active)
-            elif new_active is not old_active:
-                transfer_active_state(old_active, new_active)
-        return orig_transform_state(self, old_thing, new_thing, execution=execution)
-
-
-    preserve_active_transform_state.orig_transform_state = orig_transform_state
-    SceneLists.transform_state = preserve_active_transform_state
-
-
-    ###########################################################################
-    # Spatial focus bounds, occlusion, and directional navigation
-    ###########################################################################
-
-    # Direction specifications for spatial keyboard/controller navigation:
-    # `(axis, step)` where `axis` is the movement dimension (`0` or `1`) and `step`
-    # is `+1` (increasing screen coordinates) or `-1` (decreasing screen coordinates).
-    FOCUS_DIRECTIONS: dict[str, tuple[int, int]] = {
-        "focus_right": (0, 1),
-        "focus_left": (0, -1),
-        "focus_down": (1, 1),
-        "focus_up": (1, -1),
-    }
+    # --- Spatial Focus Bounds, Occlusion, and Directional Navigation ---------
 
 
     def get_render_content_bounds(r: Render) -> tuple[float, float, float, float] | None:
-        """Compute the tight ``(x0, y0, x1, y1)`` bounding box of
-        visible leaf surfaces in ``r``.
+        """Compute the tight bounding box of visible child surfaces
+        inside Render r.
 
-        ``LayeredImage`` sprites frequently pad their canvas to
-        full-screen dimensions with transparent space. Extracting the
-        actual drawn sub-surface bounds prevents full-screen focus
-        rectangles that break directional navigation.
+        ImageReference and Transform renders often span the full screen
+        size (e.g. 1920x1080) with the actual sprite blitted at an
+        offset inside. Walking the Render tree and applying child
+        offsets, reverse transform matrices, and clipping yields the
+        true visual bounds of the sprite.
 
         Args:
-            r (Render): The ``Render`` tree to inspect.
+            r (Render): Render tree to inspect.
 
         Returns:
-            tuple[float, float, float, float] | None:
-                ``(x0, y0, x1, y1)`` in ``r``'s local coordinates, or
-                ``None`` if ``r`` has no visible leaves.
+            tuple[float, float, float, float] | None: Bounding box (x0,
+                y0, x1, y1) in r's coordinate space, or None if r
+                contains no positive-area children.
         """
         bx0 = by0 = float("inf")
         bx1 = by1 = float("-inf")
         rev = getattr(r, "reverse", None)
-        # Check if `r.reverse` differs from the 2D identity matrix (1, 0, 0, 1).
         has_matrix = rev is not None and (rev.xdx, rev.xdy, rev.ydx, rev.ydy) != (
             1.0,
             0.0,
             0.0,
             1.0,
         )
-
-        for child, xo, yo, focus, main in r.children:
+        for child, xo, yo, _, _ in r.children:
             if isinstance(child, Render):
-                if (cb := get_render_content_bounds(child)) is None:
-                    continue
-                cx0, cy0, cx1, cy1 = cb
+                cb = get_render_content_bounds(child)
             elif hasattr(child, "get_bounding_rect"):
                 rx, ry, rw, rh = child.get_bounding_rect()
-                if rw <= 0 or rh <= 0:
-                    continue
-                cx0, cy0, cx1, cy1 = (float(rx), float(ry), float(rx + rw), float(ry + rh))
+                cb = (
+                    (float(rx), float(ry), float(rx + rw), float(ry + rh))
+                    if (rw > 0 and rh > 0)
+                    else None
+                )
             elif hasattr(child, "get_size"):
                 cw, ch = child.get_size()
-                if cw <= 0 or ch <= 0:
-                    continue
-                cx0, cy0, cx1, cy1 = 0.0, 0.0, float(cw), float(ch)
+                cb = (0.0, 0.0, float(cw), float(ch)) if (cw > 0 and ch > 0) else None
             else:
+                cb = None
+            if cb is None:
                 continue
-
-            # Map child corners through `r.reverse` when `r` applies zoom/flip/rotation.
+            cx0, cy0, cx1, cy1 = cb
             if has_matrix:
                 xs, ys = zip(*(rev.transform(x, y) for x in (cx0, cx1) for y in (cy0, cy1)))
-                tx0, ty0, tx1, ty1 = (min(xs) + xo, min(ys) + yo, max(xs) + xo, max(ys) + yo)
-            else:
-                tx0, ty0, tx1, ty1 = cx0 + xo, cy0 + yo, cx1 + xo, cy1 + yo
-
-            bx0, by0 = min(bx0, tx0), min(by0, ty0)
-            bx1, by1 = max(bx1, tx1), max(by1, ty1)
+                cx0, cy0, cx1, cy1 = min(xs), min(ys), max(xs), max(ys)
+            bx0, by0 = min(bx0, cx0 + xo), min(by0, cy0 + yo)
+            bx1, by1 = max(bx1, cx1 + xo), max(by1, cy1 + yo)
 
         if getattr(r, "xclipping", False):
             bx0, bx1 = max(0.0, bx0), min(float(r.width), bx1)
         if getattr(r, "yclipping", False):
             by0, by1 = max(0.0, by0), min(float(r.height), by1)
-
         return (bx0, by0, bx1, by1) if (bx0 < bx1 and by0 < by1) else None
 
 
-    def compute_active_focus_rect(
-        surf: Render, sw: float, sh: float
-    ) -> tuple[float, float, float, float]:
-        """Compute the tight ``(fx, fy, fw, fh)`` visible bounding box
-        of ``surf``.
+    def is_render_opaque(r: Render, x: float, y: float) -> bool:
+        """Check whether local point (x, y) inside Render r hits an
+        opaque pixel.
+
+        Ren'Py's built-in Render.is_pixel_opaque returns True for the
+        entire bounding box whenever a Render node has a non-identity
+        reverse matrix (such as a scaled or flipped Transform inside a
+        LayeredImage or button transform). Walking the Render tree and
+        transforming coordinates through each node's forward matrix down
+        to the leaf surfaces preserves exact per-pixel hit-testing
+        across transformed children.
 
         Args:
-            surf (Render): The rendered child surface.
-            sw (float): Width of ``surf``.
-            sh (float): Height of ``surf``.
+            r (Render): Render tree to test.
+            x (float): Local X coordinate in r's space.
+            y (float): Local Y coordinate in r's space.
 
         Returns:
-            tuple[float, float, float, float]: ``(fx, fy, fw, fh)`` in
-                local coordinates.
+            bool: True if (x, y) lands on a visible pixel with non-zero
+                alpha.
         """
-        if (bounds := get_render_content_bounds(surf)) is not None:
-            bx0, by0 = max(0.0, bounds[0]), max(0.0, bounds[1])
-            bx1, by1 = min(float(sw), bounds[2]), min(float(sh), bounds[3])
-        else:
-            bx0, by0, bx1, by1 = 0.0, 0.0, float(sw), float(sh)
-
-        return (bx0, by0, max(1.0, bx1 - bx0), max(1.0, by1 - by0))
-
-
-    def find_parent_render(curr: Render) -> tuple[Render | None, int, float, float]:
-        """Locate ``curr``'s active parent in the current screen render
-        tree.
-
-        Checks ``focus=True`` on child entries so internal off-tree
-        caches (such as ``Transform.child_cache``, which blits with
-        ``focus=False``) are skipped.
-
-        Args:
-            curr (Render): The ``Render`` whose parent is sought.
-
-        Returns:
-            tuple[Render | None, int, float, float]:
-                ``(parent, child_index, x_offset, y_offset)``, or
-                ``(None, -1, 0, 0)`` at the root.
-        """
-        for p in curr.parents:
-            for idx, (child, xo, yo, focus, main) in enumerate(p.children):
-                if child is curr and focus:
-                    return p, idx, xo, yo
-        return None, -1, 0, 0
+        if (
+            (r.xclipping and not (0 <= x < r.width))
+            or (r.yclipping and not (0 <= y < r.height))
+            or getattr(r, "alpha", 1.0) <= 0
+        ):
+            return False
+        for child, xo, yo, _, _ in r.children:
+            cx, cy = (
+                r.forward.transform(x - xo, y - yo) if r.forward is not None else (x - xo, y - yo)
+            )
+            if isinstance(child, Render):
+                if is_render_opaque(child, cx, cy):
+                    return True
+            elif (
+                0 <= (ix := int(cx)) < child.get_size()[0]
+                and 0 <= (iy := int(cy)) < child.get_size()[1]
+            ):
+                if hasattr(child, "get_at"):
+                    if child.get_at((ix, iy))[3] > 0:
+                        return True
+                else:
+                    sub = Render(1, 1)
+                    sub.blit(child.subsurface((ix, iy, 1, 1)), (0, 0))
+                    if renpy.display.draw.is_pixel_opaque(sub):
+                        return True
+        return False
 
 
     def is_pixel_occluded(rv: Render, cx: float, cy: float) -> bool:
-        """Check if local pixel ``(cx, cy)`` on ``rv`` is obscured by
-        any foreground ``Render``.
+        """Check whether local point (cx, cy) in rv is clipped or
+        covered by a sibling Render.
 
-        Walks up ``rv``'s ancestor chain to the screen root. At each
-        ancestor, checks whether ``(cx, cy)`` falls outside clipping
-        bounds or hits an opaque pixel on any later sibling ``Render``
-        (higher ``zorder`` on the same layer or higher layers such as
-        ``screens``).
+        Walks up the Render parent chain from rv to the root layer
+        surface, transforming (cx, cy) at each level. Returns True if
+        any ancestor clips the point out of bounds or if any later
+        sibling Render (drawn on top of rv in zorder) has an opaque
+        pixel at that position.
 
         Args:
-            rv (Render): The ``ActiveImage``'s ``Render``.
-            cx (float): Local X coordinate on ``rv``.
-            cy (float): Local Y coordinate on ``rv``.
+            rv (Render): ActiveImage Render surface.
+            cx (float): Local X coordinate within rv.
+            cy (float): Local Y coordinate within rv.
 
         Returns:
-            bool: ``True`` if ``(cx, cy)`` is clipped or covered by a
-                foreground pixel, ``False`` otherwise.
+            bool: True if the point is clipped or occluded by an upper
+                render node.
         """
         curr = rv
-        while True:
-            parent, idx, xo, yo = find_parent_render(curr)
-            if parent is None:
-                return False
-
-            # Transform child coordinates into `parent`'s coordinate space.
+        while found := next(
+            (
+                (p, i, xo, yo)
+                for p in curr.parents
+                for i, (c, xo, yo, f, _) in enumerate(p.children)
+                if c is curr and f
+            ),
+            None,
+        ):
+            parent, idx, xo, yo = found
             if parent.reverse is not None:
                 cx, cy = parent.reverse.transform(cx, cy)
-            px = cx + xo
-            py = cy + yo
-
+            px, py = cx + xo, cy + yo
             if (parent.xclipping and not (0 <= px < parent.width)) or (
                 parent.yclipping and not (0 <= py < parent.height)
             ):
                 return True
-
-            # Check all siblings drawn after `curr` (in front of `curr`).
-            for sib, sxo, syo, sfocus, smain in parent.children[idx + 1 :]:
-                if not isinstance(sib, Render):
-                    continue
-                sx, sy = px - sxo, py - syo
-                if parent.forward is not None:
-                    sx, sy = parent.forward.transform(sx, sy)
-                if sib.is_pixel_opaque(round(sx), round(sy)):
-                    return True
-
-            curr = parent
-            cx, cy = px, py
-
-
-    def make_occluded_focus_mask(
-        rv: Render, base_mask: Any, fmx: int, fmy: int
-    ) -> Callable[[int | float, int | float], bool]:
-        """Wrap ``base_mask`` into a callable focus mask that rejects
-        occluded pixels.
-
-        Ren'Py evaluates callable focus masks lazily during
-        ``find_focus()`` at mouse coordinates ``(mx, my)`` relative to
-        ``(fmx, fmy)``, after the full scene render tree
-        (``parents``/`children`) has been constructed.
-
-        Args:
-            rv (Render): The ``ActiveImage``'s ``Render``.
-            base_mask (Any): The unoccluded mask (``Render`` or
-                callable).
-            fmx (int): X offset of ``base_mask`` within ``rv``.
-            fmy (int): Y offset of ``base_mask`` within ``rv``.
-
-        Returns:
-            Callable[[int | float, int | float], bool]: A callable
-                ``(mx, my) -> bool`` suitable for ``Render.add_focus``.
-        """
-
-        def focus_mask(mx: int | float, my: int | float) -> bool:
-            if isinstance(base_mask, Render):
-                if not base_mask.is_pixel_opaque(int(mx), int(my)):
-                    return False
-            elif callable(base_mask):
-                if not base_mask(mx, my):
-                    return False
-            return not is_pixel_occluded(rv, mx + fmx, my + fmy)
-
-        return focus_mask
+            for sib, sxo, syo, _, _ in parent.children[idx + 1 :]:
+                if isinstance(sib, Render):
+                    sx, sy = px - sxo, py - syo
+                    if parent.forward is not None:
+                        sx, sy = parent.forward.transform(sx, sy)
+                    if is_render_opaque(sib, sx, sy):
+                        return True
+            curr, cx, cy = parent, px, py
+        return False
 
 
     def get_focus_spans(
         f: Focus, collapse: tuple[bool, bool] = (False, False)
     ) -> tuple[tuple[float, float], tuple[float, float]]:
-        """Compute the screen-clamped ``((p0, p1), (q0, q1))``
-        coordinate spans of ``f`` across both dimensions.
+        """Compute horizontal and vertical screen-clamped intervals for
+        Focus f.
 
-        Clamps ``ActiveImage`` bounds to the visible screen dimensions.
-        When ``collapse[axis]`` is ``True``, collapses that dimension of
-        an ``ActiveImage`` to its midpoint (``p0 = p1 = center``) so
-        overlapping sprites are compared by their center positions
-        rather than their outer edges.
+        When collapse[axis] is True for an ActiveImage, collapses that
+        axis's interval to its center point so overlapping character
+        sprites can be ordered by center position during keyboard
+        navigation.
 
         Args:
-            f (Focus): The ``Focus`` entry.
+            f (Focus): Focus entry from renpy.display.focus.focus_list.
             collapse (tuple[bool, bool], default=(False, False)):
-                Whether to collapse each dimension of an ``ActiveImage``
-                to its midpoint.
+                Pair of booleans (collapse_x, collapse_y).
 
         Returns:
-            tuple[tuple[float, float], tuple[float, float]]:
-                ``((d0_min, d0_max), (d1_min, d1_max))`` in screen
-                coordinates.
+            tuple[tuple[float, float], tuple[float, float]]: ((x0, x1),
+                (y0, y1)).
         """
-        rect = f.inset_rect()
-        origins, sizes = rect[:2], rect[2:]
+        x, y, w, h = f.inset_rect()
         if not isinstance(f.widget, ActiveImage):
-            return (
-                (float(origins[0]), float(origins[0] + sizes[0])),
-                (float(origins[1]), float(origins[1] + sizes[1])),
-            )
-
-        limits = (renpy.config.screen_width, renpy.config.screen_height)
+            return ((float(x), float(x + w)), (float(y), float(y + h)))
         spans = []
-        for origin, size, limit, col in zip(origins, sizes, limits, collapse):
-            p0, p1 = float(origin), float(origin + size)
-            c0, c1 = max(0.0, p0), min(float(limit), p1)
-            if c0 < c1:
+        for orig, size, lim, col in zip(
+            (x, y), (w, h), (renpy.config.screen_width, renpy.config.screen_height), collapse
+        ):
+            p0, p1 = float(orig), float(orig + size)
+            if (c0 := max(0.0, p0)) < (c1 := min(float(lim), p1)):
                 p0, p1 = c0, c1
-            if col:
-                p0 = p1 = (p0 + p1) * 0.5
-            spans.append((p0, p1))
+            spans.append(((p0 + p1) * 0.5, (p0 + p1) * 0.5) if col else (p0, p1))
         return (spans[0], spans[1])
 
 
     def find_directional_focus(
         from_focus: Focus, candidates: list[Focus], spec: tuple[int, int]
     ) -> Focus | None:
-        """Find the nearest candidate ``Focus`` from ``from_focus`` in
-        the direction of ``spec``.
+        """Select the nearest Focus candidate in the given arrow-key
+        direction.
 
-        - For sprite-to-sprite transitions, collapses the movement dimension to each
-            sprite's center while keeping full perpendicular spans so arbitrarily
-            overlapping sprites are traversed in strict center order.
-        - For cross-group transitions (between ``ActiveImage`` sprites and UI widgets),
-            collapses the sprite to its center point across both dimensions and requires
-            the target to lie within the 90-degree directional cone
-            (``perp_gap <= main_gap``).
+        Ren'Py's native focus_nearest requires strict non-overlapping
+        intervals along the movement axis and biases toward wide UI bars
+        when sprites overlap. By collapsing ActiveImage intervals to
+        center points along the movement axis (and on both axes when
+        crossing between sprites and UI widgets) and enforcing a
+        45-degree directional cone, this provides natural 2D arrow-key
+        navigation across sprites and screen buttons.
 
         Args:
-            from_focus (Focus): The currently focused entry.
-            candidates (list[Focus]): Eligible target ``Focus`` entries.
-            spec (tuple[int, int]): ``(axis, step)`` tuple from
-                ``FOCUS_DIRECTIONS``.
+            from_focus (Focus): Currently focused Focus entry.
+            candidates (list[Focus]): List of eligible spatial Focus
+                entries.
+            spec (tuple[int, int]): Direction tuple (axis, step) where
+                axis is 0 (X) or 1 (Y) and step is 1 (right/down) or -1
+                (left/up).
 
         Returns:
-            Focus | None: The best matching ``Focus`` entry, or ``None``
-                if no candidate lies in that direction.
+            Focus | None: Best matching target Focus, or None if none
+                qualify.
         """
         axis, step = spec
         perp = 1 - axis
-        from_is_active = isinstance(from_focus.widget, ActiveImage)
+        from_active = isinstance(from_focus.widget, ActiveImage)
         penalty = renpy.config.focus_crossrange_penalty
-
-        best = None
-        best_score = (float("inf"), float("inf"))
+        best, best_score = None, (float("inf"), float("inf"))
         for f in candidates:
             if f.widget is from_focus.widget and f.arg == from_focus.arg:
                 continue
-
-            to_is_active = isinstance(f.widget, ActiveImage)
-            cross_group = from_is_active != to_is_active
-            collapse = (axis == 0 or cross_group, axis == 1 or cross_group)
-            o_spans = get_focus_spans(from_focus, collapse)
-            n_spans = get_focus_spans(f, collapse)
-
-            om0, om1 = o_spans[axis]
-            op0, op1 = o_spans[perp]
-            nm0, nm1 = n_spans[axis]
-            np0, np1 = n_spans[perp]
-
+            to_active = isinstance(f.widget, ActiveImage)
+            cross = from_active != to_active
+            collapse = (axis == 0 or cross, axis == 1 or cross)
+            o_spans, n_spans = get_focus_spans(from_focus, collapse), get_focus_spans(f, collapse)
+            (om0, om1), (op0, op1) = o_spans[axis], o_spans[perp]
+            (nm0, nm1), (np0, np1) = n_spans[axis], n_spans[perp]
             omc, opc = (om0 + om1) * 0.5, (op0 + op1) * 0.5
             nmc, npc = (nm0 + nm1) * 0.5, (np0 + np1) * 0.5
-
-            # If intervals on the movement axis still overlap across groups (e.g. a
-            # large UI panel covering a sprite's center), compare their centers directly.
-            if cross_group and om0 < nm1 and nm0 < om1:
+            if cross and om0 < nm1 and nm0 < om1:
                 om0 = om1 = omc
                 nm0 = nm1 = nmc
-
-            if (nmc - omc) * step <= 0:
-                continue
-            if (step > 0 and om1 > nm0) or (step < 0 and nm1 > om0):
-                continue
-
             main_gap = (nm0 - om1) if step > 0 else (om0 - nm1)
+            if (nmc - omc) * step <= 0 or main_gap < 0:
+                continue
             perp_gap = max(0.0, np0 - op1, op0 - np1)
-            perp_center_diff = abs(npc - opc)
-
-            if cross_group and perp_gap > main_gap:
+            perp_diff = abs(npc - opc)
+            if (cross and perp_gap > main_gap) or (
+                from_active and to_active and perp_diff > main_gap
+            ):
                 continue
-            if from_is_active and to_is_active and perp_center_diff > main_gap:
-                continue
-
-            score = (main_gap**2 + (perp_gap * penalty) ** 2, perp_center_diff)
+            score = (main_gap**2 + (perp_gap * penalty) ** 2, perp_diff)
             if score < best_score:
                 best, best_score = f, score
         return best
 
 
     def handle_active_spatial_focus(ev: Any) -> tuple[bool, Any]:
-        """Handle keyboard/controller directional focus
-        (``focus_left``/`right`/`up`/`down`).
+        """Handle directional keyboard focus events when ActiveImages
+        are on screen.
 
-        Standard Ren'Py directional focus can fail on scene-list sprites
-        when focus rects overlap or when no widget is currently focused
-        (defaulting to UI overlay buttons instead of sprites). When
-        ``ActiveImage``s are present, this selects the best initial or
-        directional target across sprites and UI screens.
+        If no ActiveImage is present in the current focus list, returns
+        (False, None) so Ren'Py's default focus handler runs unchanged.
+        When no widget is currently focused, selects the furthest
+        ActiveImage in the pressed direction (matching Ren'Py's initial
+        arrow-key behavior).
 
         Args:
-            ev (Any): The pygame input event.
+            ev (Any): Pygame event passed to Displayable.event.
 
         Returns:
-            tuple[bool, Any]: ``(handled, result)`` where ``handled`` is
-                ``True`` if ``ev`` was consumed as a directional focus
-                event, and ``result`` is the return value of
-                ``change_focus()``.
+            tuple[bool, Any]: (handled, result) where handled is True if
+                the event was a directional focus key with active images
+                present.
         """
         if renpy.game.preferences.self_voicing:
             return False, None
-
         direction = next(
             (d for d in FOCUS_DIRECTIONS if renpy.display.behavior.map_event(ev, d)), None
         )
@@ -1458,66 +1312,103 @@ python early in active_images:
             ),
             None,
         )
-
         spec = FOCUS_DIRECTIONS[direction]
         axis, step = spec
         perp = 1 - axis
         if from_focus is None:
-            # When nothing is focused yet, pick the extreme ActiveImage for the pressed direction.
-            def initial_sort_key(f: Focus) -> tuple[float, float]:
-                spans = get_focus_spans(f, (True, True))
-                return (-step * spans[axis][0], spans[perp][0])
-
-            new_focus = min(active_focuses, key=initial_sort_key)
+            new_focus = min(
+                active_focuses,
+                key=lambda f: (
+                    -step * (s := get_focus_spans(f, (True, True)))[axis][0],
+                    s[perp][0],
+                ),
+            )
         else:
             new_focus = find_directional_focus(from_focus, spatial_focuses, spec)
-
         return True, (
             renpy.display.focus.change_focus(new_focus) if new_focus is not None else None
         )
 
 
-    ###########################################################################
-    # Rollback and rollforward state
-    ###########################################################################
+    # --- Rollback and Roll-Forward State -------------------------------------
 
 
-    class RollForwardState(NoRollback):
-        """Non-rollback state for recording ``ActiveImage`` clicks and
-        replaying them on rollforward.
+    def get_current_rollback_info() -> tuple[Any, Any]:
+        """Return the current rollback log identifier and AST node name.
 
-        Inherits from ``NoRollback`` so clicks recorded before a
-        rollback survive the state restoration and can be re-executed
-        when the player rolls forward.
+        Returns:
+            tuple[Any, Any]: Pair of (rollback_identifier,
+                ast_node_name), or (None, None) if the rollback log is
+                unavailable.
         """
-
-        forward_clicks: dict[Any, list[Any]] = python_dict()
-        active_rb_id: Any = None
-        active_node_name: Any = None
-        clicked_in_current_node: bool = False
-        rolled_forward_in_current_node: bool = False
-        current_node_clicks: list[Any] = python_list()
-        in_call_active: bool = False
+        log = getattr(renpy.game, "log", None)
+        return (
+            (log.current.identifier, log.current.context.current)
+            if (log and log.current)
+            else (None, None)
+        )
 
 
     class ActiveRollForward(Null):
-        """Underlay displayable that dispatches spatial focus and
-        replays clicks on rollforward.
+        """Underlay displayable handling directional focus and
+        roll-forward replay.
+
+        Registered in config.underlay so it receives per-interaction
+        lifecycle hooks and input events across all interactions without
+        altering screen layout. Tracks non-ending active-image clicks
+        per AST node using plain non-rollback containers, prunes stale
+        history in per_interact, and intercepts directional focus keys
+        and roll-forward events in event.
         """
 
+        def __init__(self) -> None:
+            """Initialize the underlay displayable and non-rollback
+            click tracking state.
+            """
+            super().__init__()
+            self.forward_clicks: dict[Any, list[Any]] = builtins.dict()
+            self.active_rb_id: Any = None
+            self.active_node_name: Any = None
+            self.interacted_in_node: bool = False
+            self.current_node_clicks: list[Any] = builtins.list()
+
+        def per_interact(self) -> None:
+            """Synchronize replaced active images, track AST
+            transitions, and prune roll-forward history.
+
+            Called automatically by Ren'Py on every underlay displayable
+            before each interaction begins. Ensures any replaced active
+            images are re-wrapped and clears saved clicks for the
+            previous node once it leaves the forward log without having
+            been clicked or rolled forward.
+            """
+            sync_active_images()
+            if renpy.game.interface.trans_pause or not renpy.game.context().rollback:
+                return
+            rb_id, node_name = get_current_rollback_info()
+            if rb_id is None or rb_id == self.active_rb_id:
+                return
+
+            if (prev_node := self.active_node_name) is not None and not self.interacted_in_node:
+                if all(f.name != prev_node for f in getattr(renpy.game.log, "forward", ())):
+                    self.forward_clicks.pop(prev_node, None)
+
+            self.active_rb_id, self.active_node_name = rb_id, node_name
+            self.interacted_in_node = False
+            self.current_node_clicks = builtins.list()
+
         def event(self, ev: Any, x: int, y: int, st: float) -> Any:
-            """Process directional focus events and ``rollforward``
-            events.
+            """Process directional focus keys and roll-forward events.
 
             Args:
-                ev (Any): The pygame input event.
+                ev (Any): Input event.
                 x (int): Mouse X coordinate.
                 y (int): Mouse Y coordinate.
                 st (float): Shown time in seconds.
 
             Returns:
-                Any: The focus/rollforward result, or ``None`` if ``ev``
-                    was not handled.
+                Any: Interaction return value if triggered, otherwise
+                    None.
             """
             handled, focus_rv = handle_active_spatial_focus(ev)
             if handled:
@@ -1529,17 +1420,14 @@ python early in active_images:
             if rf_target is None or not renpy.display.behavior.map_event(ev, "rollforward"):
                 return None
 
-            rb_id, node_name = get_current_rollback_info()
-            actions = (
-                RollForwardState.forward_clicks.get(node_name) if node_name is not None else None
-            )
-            if not actions:
+            _, node_name = get_current_rollback_info()
+            if not (
+                actions := (self.forward_clicks.get(node_name) if node_name is not None else None)
+            ):
                 return None
 
-            RollForwardState.rolled_forward_in_current_node = True
+            self.interacted_in_node = True
             rf_val = renpy.exports.roll_forward_core(rf_target)
-
-            # Re-run all active sprite actions that were clicked during this statement.
             try:
                 for act in actions:
                     rv = renpy.display.behavior.run(act)
@@ -1548,110 +1436,54 @@ python early in active_images:
             except (JumpException, CallException) as e:
                 if not isinstance(rf_val, (JumpException, CallException)):
                     return e
-
             return rf_val
 
 
-    def get_current_rollback_info() -> tuple[Any, Any]:
-        """Retrieve the ``(identifier, node_name)`` of the active
-        rollback log entry.
+    def wrap_click(action: Any, widget: ActiveImage) -> Callable[[], Any] | None:
+        """Wrap an ActiveImage button action to record clicks and store
+        _return.
 
-        Returns:
-            tuple[Any, Any]:
-                ``(log.current.identifier, log.current.context.current)``,
-                or ``(None, None)`` if rollback logging is unavailable.
-        """
-        log = getattr(renpy.game, "log", None)
-        if log is None or log.current is None:
-            return None, None
-        return log.current.identifier, log.current.context.current
-
-
-    def on_start_interact() -> None:
-        """Reset per-node click tracking at the start of each new script
-        interaction.
-
-        Registered in ``config.start_interact_callbacks``. If the player
-        advanced past the previous statement without clicking an active
-        sprite or rolling forward (and the node is no longer on the
-        rollforward stack), discards its recorded clicks.
-        """
-        if renpy.game.interface.trans_pause or not renpy.game.context().rollback:
-            return
-
-        rb_id, node_name = get_current_rollback_info()
-        if rb_id is None or rb_id == RollForwardState.active_rb_id:
-            return
-
-        prev_node = RollForwardState.active_node_name
-        if (
-            prev_node is not None
-            and not RollForwardState.clicked_in_current_node
-            and not RollForwardState.rolled_forward_in_current_node
-        ):
-            forward_stack = getattr(renpy.game.log, "forward", ())
-            if all(f.name != prev_node for f in forward_stack):
-                RollForwardState.forward_clicks.pop(prev_node, None)
-
-        RollForwardState.active_rb_id = rb_id
-        RollForwardState.active_node_name = node_name
-        RollForwardState.clicked_in_current_node = False
-        RollForwardState.rolled_forward_in_current_node = False
-        RollForwardState.current_node_clicks = python_list()
-
-
-    def wrap_click(action: Any) -> Callable[[], Any] | None:
-        """Wrap an ``ActiveImage`` button action for
-        rollback/rollforward and interaction return.
-
-        - Records executed actions in ``RollForwardState`` so rolling back and forward
-            replays the sprite click.
-        - Resets ``old_max_default = 0`` when an action fires so default focus calculation
-            on the next interaction is not suppressed.
-        - Stores non-jump return values in ``store._return`` and returns ``True`` during
-            standard ``say``/`pause` interactions to end the current interaction cleanly.
+        Ren'Py's built-in roll-forward only saves the final return value
+        that ended an interaction. Wrapping the button action during
+        ActiveImage.event records each click on ActiveRollForward so
+        side-effecting actions (like incrementing a counter during a
+        dialogue line) replay on roll-forward, restores the widget's
+        original action attributes before execution so saving inside an
+        action remains picklable, and stores non-None results in
+        store._return.
 
         Args:
-            action (Any): The Ren'Py action (or list of actions) to
-                wrap, or ``None``.
+            action (Any): Ren'Py Action or callable (or list of
+                actions), or None.
+            widget (ActiveImage): ActiveImage whose clicked/alternate
+                should be restored before running.
 
         Returns:
-            Callable[[], Any] | None: A zero-argument callable wrapping
-                ``action``, or ``None`` if ``action`` is ``None``.
+            Callable[[], Any] | None: Wrapped action callable, or None.
         """
         if action is None:
             return None
+        orig = (widget.clicked, widget.alternate)
 
         def wrapped() -> Any:
-            rb_id, node_name = get_current_rollback_info()
-            if node_name is not None and renpy.game.context().rollback:
-                RollForwardState.clicked_in_current_node = True
-                RollForwardState.current_node_clicks.append(action)
-                RollForwardState.forward_clicks[node_name] = python_list(
-                    RollForwardState.current_node_clicks
-                )
-
-            try:
-                rv = renpy.display.behavior.run(action)
-            except (JumpException, CallException):
-                renpy.display.focus.old_max_default = 0
-                raise
-
-            if rv is not None:
-                renpy.display.focus.old_max_default = 0
-                if not isinstance(rv, (JumpException, CallException)):
-                    renpy.store._return = rv
-                    if (
-                        not RollForwardState.in_call_active
-                        and renpy.exports.current_interact_type() in ("say", "pause")
-                        and type(rv) is not bool
-                    ):
-                        return True
-
+            widget.clicked, widget.alternate = orig
+            _, node_name = get_current_rollback_info()
+            rf = next((d for d in renpy.config.underlay if isinstance(d, ActiveRollForward)), None)
+            if rf is not None and node_name is not None and renpy.game.context().rollback:
+                rf.interacted_in_node = True
+                rf.current_node_clicks.append(action)
+                rf.forward_clicks[node_name] = builtins.list(rf.current_node_clicks)
+            rv = renpy.display.behavior.run(action)
+            if rv is not None and not isinstance(rv, (JumpException, CallException)):
+                renpy.store._return = rv
+                if (
+                    renpy.exports.current_interact_type() in ("say", "pause")
+                    and type(rv) is not bool
+                ):
+                    return True
             return rv
 
         return wrapped
 
-
 define config.underlay += [active_images.ActiveRollForward()]
-define config.start_interact_callbacks += [active_images.on_start_interact]
+define config.statement_callbacks += [active_images.sync_active_images]
