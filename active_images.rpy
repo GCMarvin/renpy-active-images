@@ -668,9 +668,9 @@ python early in active_images:
         and button clauses.
 
         Uses Ren'Py's native parse_image_specifier for the leading image
-        and show clauses, then continues parsing interspersed button
-        clauses (for 'activate') and trailing show/with clauses in any
-        order.
+        and show clauses (truncating the line at the first button clause
+        so button keywords are not consumed as image attributes), then
+        parses remaining button, show, and with clauses in any order.
 
         Args:
             l (Lexer): Ren'Py script lexer positioned after the
@@ -683,10 +683,18 @@ python early in active_images:
                 'imspec', 'button_clauses', and 'with_expr'.
         """
         stmt = "activate" if allow_button_clauses else "deactivate"
+        start, orig_text = l.pos, l.text
+        if l.image_name_component() not in (None, "expression", "image"):
+            while (pos := l.pos) and (w := l.image_name_component()):
+                if w in BUTTON_CLAUSES:
+                    l.text = orig_text[:pos]
+                    break
+        l.pos = start
         name, expression, tag, at_list, layer, zorder, behind = parse_image_specifier(l)
+        l.text, l.word_cache_pos = orig_text, -1
         clauses: dict[str, Any] = {
-            "at": list(at_list),
             "as": tag,
+            "at": list(at_list),
             "onlayer": layer,
             "zorder": zorder,
             "behind": list(behind or ()),
@@ -694,20 +702,16 @@ python early in active_images:
         }
         button_clauses: dict[str, str] = {}
 
-        while not l.eol() and not l.match(":"):
-            pos = l.checkpoint()
-            if not (word := l.word()):
-                l.error(f"expected clause in {stmt} statement.")
+        while word := l.word():
             if word in clauses:
                 if clauses[word]:
                     l.error(f"duplicate '{word}' clause in {stmt} statement.")
                 if word == "at":
                     clauses["at"] = list(parse_simple_expression_list(l, image=True))
                 elif word == "behind":
-                    while True:
+                    clauses["behind"].append(l.require(l.name))
+                    while l.match(","):
                         clauses["behind"].append(l.require(l.name))
-                        if not l.match(","):
-                            break
                 elif word == "as":
                     clauses["as"] = l.require(l.name)
                 elif word == "onlayer":
@@ -719,19 +723,14 @@ python early in active_images:
                     l.error(f"duplicate '{word}' clause in {stmt} statement.")
                 button_clauses[word] = l.require(l.simple_expression)
             else:
-                l.revert(pos)
                 l.error(f"unexpected clause '{word}' in {stmt} statement.")
 
-        imspec = (
-            name,
-            expression,
-            clauses["as"],
-            clauses["at"],
-            clauses["onlayer"],
-            clauses["zorder"],
-            clauses["behind"],
-        )
-        return {"imspec": imspec, "button_clauses": button_clauses, "with_expr": clauses["with"]}
+        (l.expect_block if l.match(":") else l.expect_noblock)(f"{stmt} statement")
+        l.expect_eol()
+
+        with_expr = clauses.pop("with")
+        imspec = (name, expression, *clauses.values())
+        return {"imspec": imspec, "button_clauses": button_clauses, "with_expr": with_expr}
 
 
     def execute_activate_or_deactivate(
@@ -974,7 +973,7 @@ python early in active_images:
             renpy.game.interface.do_with(None, None)
         if isinstance(rv, (JumpException, CallException)):
             raise rv
-        renpy.store._return = rv
+        renpy.store._return = None if (delay is not None and rv is False) else rv
 
 
     def lint_call_active(p: dict[str, Any]) -> None:
