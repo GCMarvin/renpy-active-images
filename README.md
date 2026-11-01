@@ -174,9 +174,7 @@ Any part of an active image covered by another image or UI screen in front of it
 ```renpy
 label start:
     show bush zorder 1
-
-    activate lucy zorder 0 action Return():
-        xoffset 100
+    activate lucy zorder 0 action Return()
 
     call active:
         "Find Lucy."
